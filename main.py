@@ -330,41 +330,36 @@ async def market_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 """
     
-    for pair in TRADING_PAIRS:
+    # Fetch all prices concurrently for speed
+    async def get_pair_data(pair):
         try:
             price = await get_public_price(pair)
-            candle_data = await get_public_candles(pair)
-            
-            if price > 0:
-                change = 0
-                trend = ""
-                if candle_data:
-                    prices = candle_data.get("prices", [])
-                    if len(prices) >= 2:
-                        change = ((prices[0] - prices[1]) / prices[1]) * 100
-                    if len(prices) >= 21:
-                        sma_8 = sum(prices[:8]) / 8
-                        sma_21 = sum(prices[:21]) / 21
-                        trend = " 📈" if sma_8 > sma_21 else " 📉"
-                
-                emoji = "🟢" if change > 0 else "🔴" if change < 0 else "⚪"
-                coin = pair.split("-")[0]
-                text += f"{emoji} <b>{coin}</b>: ${price:,.2f} ({change:+.2f}%){trend}\n"
-            else:
-                text += f"⚠️ {pair}: No data\n"
-                
+            return {"pair": pair, "price": price, "error": None}
         except Exception as e:
-            print(f"[ERROR] market {pair}: {e}")
-            text += f"⚠️ {pair}: Error\n"
+            return {"pair": pair, "price": 0, "error": str(e)}
+    
+    # Run all requests concurrently
+    results = await asyncio.gather(*[get_pair_data(pair) for pair in TRADING_PAIRS])
+    
+    for result in results:
+        pair = result["pair"]
+        price = result["price"]
+        coin = pair.split("-")[0]
+        
+        if price > 0:
+            text += f"🪙 <b>{coin}</b>: ${price:,.2f}\n"
+        else:
+            text += f"⚠️ {coin}: No data\n"
     
     text += """
 ━━━━━━━━━━━━━━━
-📈 = Bullish trend (SMA8 > SMA21)
-📉 = Bearish trend (SMA8 < SMA21)
-
 <i>Use /signals for full AI analysis</i>"""
     
-    await msg.edit_text(text, parse_mode="HTML")
+    try:
+        await msg.edit_text(text, parse_mode="HTML")
+    except Exception as e:
+        print(f"[ERROR] edit message: {e}")
+        await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
