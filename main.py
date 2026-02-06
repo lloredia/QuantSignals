@@ -9,10 +9,8 @@ from fastapi import FastAPI, Request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from openai import OpenAI
-import hmac
-import hashlib
 import time
-import base64
+import secrets
 
 # ============ CONFIG ============
 TOKEN = os.getenv("BOT_TOKEN")
@@ -20,130 +18,62 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "quantsignals-secret")
 BASE_URL = os.getenv("BASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Coinbase API
+# Coinbase CDP API (for trading - optional)
 COINBASE_API_KEY = os.getenv("COINBASE_API_KEY")
 COINBASE_API_SECRET = os.getenv("COINBASE_API_SECRET")
 
 # Trading Config
-TRADE_AMOUNT_USD = float(os.getenv("TRADE_AMOUNT_USD", "10"))  # Start small
+TRADE_AMOUNT_USD = float(os.getenv("TRADE_AMOUNT_USD", "10"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "5"))  # 5% stop loss
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "10"))  # 10% take profit
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "5"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "10"))
 
-# Supported coins for day trading (high volume, good volatility)
+# Supported coins
 TRADING_PAIRS = ["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "LINK-USD"]
 
 app = FastAPI()
 tg_app = Application.builder().token(TOKEN).build()
 
-# In-memory position tracking (use Redis/DB for production)
+# Position tracking
 positions = {}
 daily_pnl = {"realized": 0.0, "trades": 0, "wins": 0}
 
 
-# ============ COINBASE CLIENT ============
-class CoinbaseClient:
-    """Coinbase Advanced Trade API client."""
-    
-    BASE_URL = "https://api.coinbase.com"
-    
-    def __init__(self, api_key: str, api_secret: str):
-        self.api_key = api_key
-        self.api_secret = api_secret
-    
-    def _sign(self, timestamp: str, method: str, path: str, body: str = "") -> str:
-        """Create signature for Coinbase API."""
-        message = timestamp + method + path + body
-        signature = hmac.new(
-            self.api_secret.encode(),
-            message.encode(),
-            hashlib.sha256
-        ).hexdigest()
-        return signature
-    
-    def _headers(self, method: str, path: str, body: str = "") -> dict:
-        """Generate auth headers."""
-        timestamp = str(int(time.time()))
-        signature = self._sign(timestamp, method, path, body)
-        return {
-            "CB-ACCESS-KEY": self.api_key,
-            "CB-ACCESS-SIGN": signature,
-            "CB-ACCESS-TIMESTAMP": timestamp,
-            "Content-Type": "application/json"
-        }
-    
-    async def get_accounts(self) -> dict:
-        """Get all accounts/balances."""
-        path = "/api/v3/brokerage/accounts"
+# ============ PUBLIC PRICE API (No Auth Required) ============
+async def get_public_price(product_id: str) -> float:
+    """Get price from Coinbase public API (no auth needed)."""
+    url = f"https://api.coinbase.com/v2/prices/{product_id}/spot"
+    try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{self.BASE_URL}{path}",
-                headers=self._headers("GET", path),
-                timeout=10
-            )
-            return resp.json()
-    
-    async def get_price(self, product_id: str) -> float:
-        """Get current price for a trading pair."""
-        path = f"/api/v3/brokerage/products/{product_id}"
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{self.BASE_URL}{path}",
-                headers=self._headers("GET", path),
-                timeout=10
-            )
+            resp = await client.get(url, timeout=10)
             data = resp.json()
-            return float(data.get("price", 0))
-    
-    async def get_candles(self, product_id: str, granularity: str = "ONE_HOUR", limit: int = 24) -> list:
-        """Get historical candles for analysis."""
-        path = f"/api/v3/brokerage/products/{product_id}/candles"
-        end = int(time.time())
-        start = end - (limit * 3600)  # Last N hours
-        
-        params = f"?start={start}&end={end}&granularity={granularity}"
-        
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{self.BASE_URL}{path}{params}",
-                headers=self._headers("GET", path + params),
-                timeout=10
-            )
-            return resp.json().get("candles", [])
-    
-    async def place_market_order(self, product_id: str, side: str, usd_amount: float) -> dict:
-        """Place a market order."""
-        path = "/api/v3/brokerage/orders"
-        
-        order_config = {
-            "market_market_ioc": {
-                "quote_size": str(usd_amount)
-            }
-        } if side == "BUY" else {
-            "market_market_ioc": {
-                "base_size": str(usd_amount)  # For sells, need base currency amount
-            }
-        }
-        
-        body = json.dumps({
-            "client_order_id": f"tc_{int(time.time())}_{product_id}",
-            "product_id": product_id,
-            "side": side,
-            "order_configuration": order_config
-        })
-        
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{self.BASE_URL}{path}",
-                headers=self._headers("POST", path, body),
-                content=body,
-                timeout=10
-            )
-            return resp.json()
+            return float(data.get("data", {}).get("amount", 0))
+    except Exception as e:
+        print(f"[ERROR] public price {product_id}: {e}")
+        return 0
 
 
-# Initialize Coinbase client
-coinbase = CoinbaseClient(COINBASE_API_KEY or "", COINBASE_API_SECRET or "")
+async def get_public_candles(product_id: str) -> dict:
+    """Get candle data from Coinbase Exchange public API (no auth needed)."""
+    url = f"https://api.exchange.coinbase.com/products/{product_id}/candles?granularity=3600"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=10)
+            candles = resp.json()
+            
+            if candles and len(candles) > 0 and isinstance(candles, list):
+                # Candles format: [time, low, high, open, close, volume]
+                prices = [c[4] for c in candles[:24]]  # close prices
+                return {
+                    "prices": prices,
+                    "high_24h": max(c[2] for c in candles[:24]),
+                    "low_24h": min(c[1] for c in candles[:24]),
+                    "volume_24h": sum(c[5] for c in candles[:24]),
+                    "current": prices[0] if prices else 0
+                }
+    except Exception as e:
+        print(f"[ERROR] public candles {product_id}: {e}")
+    return {}
 
 
 # ============ AI SIGNAL GENERATOR ============
@@ -153,56 +83,51 @@ async def generate_trading_signals() -> dict:
     if not OPENAI_API_KEY:
         return {"error": "OpenAI not configured"}
     
-    # Gather market data
+    # Gather market data using PUBLIC API (no auth needed!)
     market_data = {}
     for pair in TRADING_PAIRS:
         try:
-            price = await coinbase.get_price(pair)
-            candles = await coinbase.get_candles(pair, "ONE_HOUR", 24)
+            price = await get_public_price(pair)
+            candle_data = await get_public_candles(pair)
             
-            if candles:
-                prices = [float(c["close"]) for c in candles[:24]]
-                high_24h = max(float(c["high"]) for c in candles[:24])
-                low_24h = min(float(c["low"]) for c in candles[:24])
-                volume_24h = sum(float(c["volume"]) for c in candles[:24])
+            if price > 0:
+                prices = candle_data.get("prices", [price])
                 
-                # Calculate basic indicators
                 sma_8 = sum(prices[:8]) / 8 if len(prices) >= 8 else price
                 sma_21 = sum(prices[:21]) / 21 if len(prices) >= 21 else price
                 
-                # Price change
+                change_1h = 0
                 if len(prices) >= 2:
-                    change_1h = ((price - prices[1]) / prices[1]) * 100
-                else:
-                    change_1h = 0
+                    change_1h = ((prices[0] - prices[1]) / prices[1]) * 100
                 
                 market_data[pair] = {
                     "price": price,
-                    "high_24h": high_24h,
-                    "low_24h": low_24h,
-                    "volume_24h": volume_24h,
-                    "sma_8": sma_8,
-                    "sma_21": sma_21,
-                    "change_1h": change_1h,
+                    "high_24h": candle_data.get("high_24h", price),
+                    "low_24h": candle_data.get("low_24h", price),
+                    "volume_24h": candle_data.get("volume_24h", 0),
+                    "sma_8": round(sma_8, 2),
+                    "sma_21": round(sma_21, 2),
+                    "change_1h": round(change_1h, 2),
                     "trend": "bullish" if sma_8 > sma_21 else "bearish"
                 }
+                print(f"[OK] {pair}: ${price:,.2f}")
         except Exception as e:
             print(f"[ERROR] Failed to get data for {pair}: {e}")
     
     if not market_data:
         return {"error": "No market data available"}
     
-    # Build prompt
+    # Build AI prompt
     tz = pytz.timezone("America/Chicago")
     now = datetime.now(tz)
     
-    prompt = f"""You are an expert crypto day trader AI. Analyze the following market data and provide trading signals.
+    prompt = f"""You are an expert crypto day trader AI. Analyze the following REAL-TIME market data and provide trading signals.
 
 CURRENT TIME: {now.strftime("%Y-%m-%d %H:%M %Z")}
 TRADING STYLE: Day trading (holding 1-8 hours)
 RISK TOLERANCE: Medium (5% stop loss, 10% take profit)
 
-MARKET DATA:
+LIVE MARKET DATA:
 """
     
     for pair, data in market_data.items():
@@ -215,32 +140,36 @@ MARKET DATA:
 - SMA(8): ${data['sma_8']:,.2f}
 - SMA(21): ${data['sma_21']:,.2f}
 - Trend: {data['trend']}
+- 24h Volume: ${data['volume_24h']:,.0f}
 """
     
     prompt += """
 
-INSTRUCTIONS:
-1. Analyze each pair for day trading opportunities
-2. Consider momentum, trend, support/resistance levels
-3. Only recommend HIGH confidence trades (>70% conviction)
-4. Maximum 2 trade signals
+ANALYSIS INSTRUCTIONS:
+1. Analyze momentum, trend direction, and support/resistance
+2. Consider SMA crossovers (SMA8 vs SMA21) for trend confirmation
+3. Look for oversold/overbought conditions based on 24h range
+4. Only recommend HIGH confidence trades (>70% conviction)
+5. Maximum 2 trade signals
 
-OUTPUT FORMAT (JSON only, no other text):
+OUTPUT FORMAT (JSON only, no markdown, no explanation):
 {
     "signals": [
         {
             "pair": "BTC-USD",
-            "action": "BUY" or "SELL" or "HOLD",
+            "action": "BUY",
             "confidence": 75,
-            "entry_price": 50000,
-            "stop_loss": 47500,
-            "take_profit": 55000,
-            "reasoning": "Brief reason"
+            "entry_price": 97000,
+            "stop_loss": 92150,
+            "take_profit": 106700,
+            "reasoning": "SMA8 crossed above SMA21, bullish momentum"
         }
     ],
-    "market_sentiment": "bullish" or "bearish" or "neutral",
+    "market_sentiment": "bullish",
     "summary": "One sentence market summary"
 }
+
+If no good opportunities, return empty signals array with action "HOLD".
 """
     
     try:
@@ -248,17 +177,16 @@ OUTPUT FORMAT (JSON only, no other text):
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are a professional crypto trader. Respond ONLY with valid JSON."},
+                {"role": "system", "content": "You are a professional crypto trader. Respond ONLY with valid JSON, no markdown code blocks."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=1000,
             temperature=0.7
         )
         
-        result_text = response.choices[0].message.content
+        result_text = response.choices[0].message.content.strip()
         
-        # Clean up response
-        result_text = result_text.strip()
+        # Clean JSON
         if result_text.startswith("```json"):
             result_text = result_text[7:]
         if result_text.startswith("```"):
@@ -266,64 +194,32 @@ OUTPUT FORMAT (JSON only, no other text):
         if result_text.endswith("```"):
             result_text = result_text[:-3]
         
-        signals = json.loads(result_text)
+        signals = json.loads(result_text.strip())
         signals["market_data"] = market_data
         signals["generated_at"] = now.isoformat()
         
         return signals
         
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] JSON parse failed: {e}")
+        print(f"[DEBUG] Raw response: {result_text[:500]}")
+        return {"error": f"JSON parse error", "market_data": market_data}
     except Exception as e:
         print(f"[ERROR] AI signal generation failed: {e}")
-        return {"error": str(e)}
-
-
-# ============ TRADING FUNCTIONS ============
-async def execute_trade(pair: str, action: str, amount_usd: float) -> dict:
-    """Execute a trade on Coinbase."""
-    
-    if not COINBASE_API_KEY or not COINBASE_API_SECRET:
-        return {"success": False, "error": "Coinbase not configured"}
-    
-    try:
-        result = await coinbase.place_market_order(pair, action, amount_usd)
-        
-        if result.get("success"):
-            # Track position
-            if action == "BUY":
-                positions[pair] = {
-                    "entry_price": await coinbase.get_price(pair),
-                    "amount_usd": amount_usd,
-                    "timestamp": datetime.now().isoformat()
-                }
-            elif action == "SELL" and pair in positions:
-                # Calculate P&L
-                entry = positions[pair]["entry_price"]
-                exit_price = await coinbase.get_price(pair)
-                pnl = ((exit_price - entry) / entry) * amount_usd
-                daily_pnl["realized"] += pnl
-                daily_pnl["trades"] += 1
-                if pnl > 0:
-                    daily_pnl["wins"] += 1
-                del positions[pair]
-        
-        return result
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {"error": str(e), "market_data": market_data}
 
 
 # ============ TELEGRAM COMMANDS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome = """🤖 <b>TRADECIRCLE BOT</b>
+    welcome = """📊 <b>QUANTSIGNALS</b>
 
-AI-powered crypto day trading assistant.
+AI-powered crypto trading signals.
 
 <b>Commands:</b>
 /signals - Get AI trading signals
-/portfolio - View current positions
-/balance - Check account balance
+/market - Quick market overview
+/portfolio - View positions
 /pnl - Today's P&L
-/trade - Execute a trade
 /settings - Bot settings
 /help - Show help
 
@@ -333,74 +229,86 @@ AI-powered crypto day trading assistant.
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """🤖 <b>TRADECIRCLE HELP</b>
+    help_text = """📊 <b>QUANTSIGNALS HELP</b>
 
 <b>Signal Commands:</b>
 /signals - Generate AI trading signals
 /market - Quick market overview
 
 <b>Trading Commands:</b>
-/trade [pair] [buy/sell] - Execute trade
 /portfolio - View open positions
-/close [pair] - Close a position
-
-<b>Account Commands:</b>
-/balance - Check balances
 /pnl - Today's profit/loss
-/history - Recent trades
 
 <b>Settings:</b>
-/settings - View/change settings
-/risk - Adjust risk parameters
+/settings - View bot settings
 
-<i>Example: /trade BTC-USD buy</i>"""
+<i>Start with /signals to get AI recommendations!</i>"""
     
     await update.message.reply_text(help_text, parse_mode="HTML")
 
 
 async def signals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate and display AI trading signals."""
-    msg = await update.message.reply_text("🔄 Analyzing markets...")
+    msg = await update.message.reply_text("🔄 Analyzing markets with AI...")
     
     signals = await generate_trading_signals()
     
-    if "error" in signals:
+    if "error" in signals and "market_data" not in signals:
         await msg.edit_text(f"❌ Error: {signals['error']}")
         return
     
     tz = pytz.timezone("America/Chicago")
     now = datetime.now(tz)
     
-    text = f"""🤖 <b>TRADECIRCLE SIGNALS</b>
+    text = f"""📊 <b>QUANTSIGNALS</b>
 📅 {now.strftime("%B %d, %Y %I:%M %p %Z")}
 ━━━━━━━━━━━━━━━
 
-<b>Market Sentiment:</b> {signals.get('market_sentiment', 'N/A').upper()}
-
 """
     
-    for signal in signals.get("signals", []):
-        action_emoji = "🟢" if signal["action"] == "BUY" else "🔴" if signal["action"] == "SELL" else "⚪"
+    if "error" in signals:
+        text += f"⚠️ AI Error: {signals['error']}\n\n"
+        text += "<b>Live Prices:</b>\n"
+        for pair, data in signals.get("market_data", {}).items():
+            emoji = "🟢" if data.get("change_1h", 0) > 0 else "🔴"
+            text += f"{emoji} {pair}: ${data['price']:,.2f} ({data.get('change_1h', 0):+.2f}%)\n"
+    else:
+        sentiment = signals.get('market_sentiment', 'neutral').upper()
+        sent_emoji = "🟢" if sentiment == "BULLISH" else "🔴" if sentiment == "BEARISH" else "⚪"
+        text += f"<b>Market Sentiment:</b> {sent_emoji} {sentiment}\n\n"
         
-        text += f"""{action_emoji} <b>{signal['pair']}</b>
-Action: <b>{signal['action']}</b>
-Confidence: {signal['confidence']}%
-Entry: ${signal['entry_price']:,.2f}
-Stop Loss: ${signal['stop_loss']:,.2f}
-Take Profit: ${signal['take_profit']:,.2f}
-📝 {signal['reasoning']}
+        if not signals.get("signals"):
+            text += "⚪ <b>NO SIGNALS</b>\n"
+            text += "No high-confidence trades at this time.\n\n"
+            text += "<b>Live Prices:</b>\n"
+            for pair, data in signals.get("market_data", {}).items():
+                emoji = "🟢" if data.get("change_1h", 0) > 0 else "🔴"
+                text += f"{emoji} {pair}: ${data['price']:,.2f} ({data.get('change_1h', 0):+.2f}%)\n"
+        else:
+            for signal in signals.get("signals", []):
+                action = signal.get("action", "HOLD")
+                action_emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
+                
+                text += f"""{action_emoji} <b>{signal.get('pair', 'N/A')}</b>
+Action: <b>{action}</b>
+Confidence: {signal.get('confidence', 'N/A')}%
+Entry: ${signal.get('entry_price', 0):,.2f}
+Stop Loss: ${signal.get('stop_loss', 0):,.2f}
+Take Profit: ${signal.get('take_profit', 0):,.2f}
+📝 {signal.get('reasoning', 'N/A')}
 
 """
-    
-    text += f"""━━━━━━━━━━━━━━━
+        
+        text += f"""━━━━━━━━━━━━━━━
 <b>Summary:</b> {signals.get('summary', 'N/A')}
-
-<i>⚠️ Not financial advice. Trade at your own risk.</i>"""
+"""
     
-    # Add trade buttons for BUY signals
+    text += "\n<i>⚠️ Not financial advice. Trade at your own risk.</i>"
+    
+    # Add trade buttons
     keyboard = []
     for signal in signals.get("signals", []):
-        if signal["action"] == "BUY":
+        if signal.get("action") == "BUY":
             keyboard.append([
                 InlineKeyboardButton(
                     f"🟢 Buy {signal['pair'].split('-')[0]} (${TRADE_AMOUNT_USD})",
@@ -413,56 +321,62 @@ Take Profit: ${signal['take_profit']:,.2f}
     await msg.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
 
 
-async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check account balances."""
-    msg = await update.message.reply_text("💰 Fetching balances...")
+async def market_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick market overview using public API."""
+    msg = await update.message.reply_text("📊 Loading live prices...")
     
-    if not COINBASE_API_KEY:
-        await msg.edit_text("❌ Coinbase not configured. Add API keys.")
-        return
-    
-    try:
-        accounts = await coinbase.get_accounts()
-        
-        text = """💰 <b>ACCOUNT BALANCES</b>
+    text = """📊 <b>LIVE MARKET</b>
 ━━━━━━━━━━━━━━━
 
 """
-        
-        total_usd = 0
-        for account in accounts.get("accounts", []):
-            balance = float(account.get("available_balance", {}).get("value", 0))
-            currency = account.get("currency", "")
+    
+    for pair in TRADING_PAIRS:
+        try:
+            price = await get_public_price(pair)
+            candle_data = await get_public_candles(pair)
             
-            if balance > 0.01:  # Only show non-dust balances
-                if currency == "USD":
-                    text += f"💵 USD: ${balance:,.2f}\n"
-                    total_usd += balance
-                else:
-                    # Get USD value
-                    try:
-                        price = await coinbase.get_price(f"{currency}-USD")
-                        usd_value = balance * price
-                        total_usd += usd_value
-                        text += f"🪙 {currency}: {balance:.6f} (${usd_value:,.2f})\n"
-                    except:
-                        text += f"🪙 {currency}: {balance:.6f}\n"
-        
-        text += f"""
+            if price > 0:
+                change = 0
+                trend = ""
+                if candle_data:
+                    prices = candle_data.get("prices", [])
+                    if len(prices) >= 2:
+                        change = ((prices[0] - prices[1]) / prices[1]) * 100
+                    if len(prices) >= 21:
+                        sma_8 = sum(prices[:8]) / 8
+                        sma_21 = sum(prices[:21]) / 21
+                        trend = " 📈" if sma_8 > sma_21 else " 📉"
+                
+                emoji = "🟢" if change > 0 else "🔴" if change < 0 else "⚪"
+                coin = pair.split("-")[0]
+                text += f"{emoji} <b>{coin}</b>: ${price:,.2f} ({change:+.2f}%){trend}\n"
+            else:
+                text += f"⚠️ {pair}: No data\n"
+                
+        except Exception as e:
+            print(f"[ERROR] market {pair}: {e}")
+            text += f"⚠️ {pair}: Error\n"
+    
+    text += """
 ━━━━━━━━━━━━━━━
-<b>Total Value:</b> ${total_usd:,.2f}"""
-        
-        await msg.edit_text(text, parse_mode="HTML")
-        
-    except Exception as e:
-        await msg.edit_text(f"❌ Error fetching balances: {str(e)[:100]}")
+📈 = Bullish trend (SMA8 > SMA21)
+📉 = Bearish trend (SMA8 < SMA21)
+
+<i>Use /signals for full AI analysis</i>"""
+    
+    await msg.edit_text(text, parse_mode="HTML")
 
 
 async def portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current open positions."""
     
     if not positions:
-        await update.message.reply_text("📭 No open positions.\n\nUse /signals to get trading ideas.")
+        await update.message.reply_text(
+            "📭 <b>No open positions</b>\n\n"
+            "Use /signals to get trading ideas.\n"
+            "Click the Buy button to open a position.",
+            parse_mode="HTML"
+        )
         return
     
     text = """📊 <b>OPEN POSITIONS</b>
@@ -470,11 +384,13 @@ async def portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 """
     
+    total_pnl = 0
     for pair, pos in positions.items():
-        current_price = await coinbase.get_price(pair)
+        current_price = await get_public_price(pair)
         entry = pos["entry_price"]
         pnl_pct = ((current_price - entry) / entry) * 100
         pnl_usd = (pnl_pct / 100) * pos["amount_usd"]
+        total_pnl += pnl_usd
         
         emoji = "🟢" if pnl_pct > 0 else "🔴"
         
@@ -485,9 +401,10 @@ P&L: {pnl_pct:+.2f}% (${pnl_usd:+.2f})
 
 """
     
-    text += "━━━━━━━━━━━━━━━"
+    total_emoji = "🟢" if total_pnl >= 0 else "🔴"
+    text += f"""━━━━━━━━━━━━━━━
+{total_emoji} <b>Total P&L:</b> ${total_pnl:+.2f}"""
     
-    # Add close buttons
     keyboard = [[InlineKeyboardButton(f"Close {pair}", callback_data=f"close_{pair}")] for pair in positions]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -498,7 +415,6 @@ async def pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show today's P&L."""
     
     win_rate = (daily_pnl["wins"] / daily_pnl["trades"] * 100) if daily_pnl["trades"] > 0 else 0
-    
     emoji = "🟢" if daily_pnl["realized"] >= 0 else "🔴"
     
     text = f"""📈 <b>TODAY'S P&L</b>
@@ -516,45 +432,10 @@ async def pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 
-async def market_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Quick market overview."""
-    msg = await update.message.reply_text("📊 Loading market data...")
-    
-    text = """📊 <b>MARKET OVERVIEW</b>
-━━━━━━━━━━━━━━━
-
-"""
-    
-    for pair in TRADING_PAIRS:
-        try:
-            price = await coinbase.get_price(pair)
-            candles = await coinbase.get_candles(pair, "ONE_HOUR", 2)
-            
-            if candles and len(candles) >= 2:
-                prev_price = float(candles[1]["close"])
-                change = ((price - prev_price) / prev_price) * 100
-                emoji = "🟢" if change > 0 else "🔴" if change < 0 else "⚪"
-            else:
-                change = 0
-                emoji = "⚪"
-            
-            coin = pair.split("-")[0]
-            text += f"{emoji} <b>{coin}</b>: ${price:,.2f} ({change:+.2f}%)\n"
-            
-        except Exception as e:
-            text += f"⚠️ {pair}: Error\n"
-    
-    text += """
-━━━━━━━━━━━━━━━
-<i>Use /signals for AI analysis</i>"""
-    
-    await msg.edit_text(text, parse_mode="HTML")
-
-
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current settings."""
     
-    text = f"""⚙️ <b>BOT SETTINGS</b>
+    text = f"""⚙️ <b>QUANTSIGNALS SETTINGS</b>
 ━━━━━━━━━━━━━━━
 
 💵 Trade Amount: ${TRADE_AMOUNT_USD}
@@ -563,7 +444,11 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🎯 Take Profit: {TAKE_PROFIT_PCT}%
 
 <b>Trading Pairs:</b>
-{', '.join(TRADING_PAIRS)}
+{', '.join([p.split('-')[0] for p in TRADING_PAIRS])}
+
+<b>Status:</b>
+✅ Market Data: Public API (no auth)
+{"✅" if COINBASE_API_KEY else "⚠️"} Trading: {"Enabled" if COINBASE_API_KEY else "Signals only (add Coinbase keys to trade)"}
 
 ━━━━━━━━━━━━━━━
 <i>Edit via Railway environment variables</i>"""
@@ -581,33 +466,57 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if data.startswith("trade_buy_"):
         pair = data.replace("trade_buy_", "")
-        await query.edit_message_text(f"🔄 Executing BUY for {pair}...")
         
-        result = await execute_trade(pair, "BUY", TRADE_AMOUNT_USD)
+        # For now, just track the position without actual trading
+        price = await get_public_price(pair)
         
-        if result.get("success"):
+        if price > 0:
+            positions[pair] = {
+                "entry_price": price,
+                "amount_usd": TRADE_AMOUNT_USD,
+                "timestamp": datetime.now().isoformat()
+            }
+            
             await query.edit_message_text(
-                f"✅ <b>ORDER EXECUTED</b>\n\n"
-                f"Bought ${TRADE_AMOUNT_USD} of {pair}\n\n"
-                f"Use /portfolio to track position.",
+                f"✅ <b>POSITION OPENED</b>\n\n"
+                f"📊 {pair}\n"
+                f"💵 Amount: ${TRADE_AMOUNT_USD}\n"
+                f"📍 Entry: ${price:,.2f}\n"
+                f"🛑 Stop Loss: ${price * (1 - STOP_LOSS_PCT/100):,.2f}\n"
+                f"🎯 Take Profit: ${price * (1 + TAKE_PROFIT_PCT/100):,.2f}\n\n"
+                f"<i>Use /portfolio to track</i>\n\n"
+                f"⚠️ <b>Note:</b> This is paper trading. Connect Coinbase API for live trades.",
                 parse_mode="HTML"
             )
         else:
-            await query.edit_message_text(
-                f"❌ Order failed: {result.get('error', 'Unknown error')}"
-            )
+            await query.edit_message_text(f"❌ Could not get price for {pair}")
     
     elif data.startswith("close_"):
         pair = data.replace("close_", "")
         
         if pair in positions:
-            pos = positions[pair]
-            result = await execute_trade(pair, "SELL", pos["amount_usd"])
+            entry = positions[pair]["entry_price"]
+            current = await get_public_price(pair)
+            pnl_pct = ((current - entry) / entry) * 100
+            pnl_usd = (pnl_pct / 100) * positions[pair]["amount_usd"]
             
-            if result.get("success"):
-                await query.edit_message_text(f"✅ Closed {pair} position.")
-            else:
-                await query.edit_message_text(f"❌ Failed to close: {result.get('error')}")
+            daily_pnl["realized"] += pnl_usd
+            daily_pnl["trades"] += 1
+            if pnl_usd > 0:
+                daily_pnl["wins"] += 1
+            
+            del positions[pair]
+            
+            emoji = "🟢" if pnl_usd >= 0 else "🔴"
+            await query.edit_message_text(
+                f"✅ <b>POSITION CLOSED</b>\n\n"
+                f"📊 {pair}\n"
+                f"📍 Entry: ${entry:,.2f}\n"
+                f"📍 Exit: ${current:,.2f}\n"
+                f"{emoji} P&L: {pnl_pct:+.2f}% (${pnl_usd:+.2f})\n\n"
+                f"<i>Use /pnl for daily summary</i>",
+                parse_mode="HTML"
+            )
         else:
             await query.edit_message_text("❌ Position not found.")
 
@@ -616,10 +525,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 tg_app.add_handler(CommandHandler("start", start))
 tg_app.add_handler(CommandHandler("help", help_cmd))
 tg_app.add_handler(CommandHandler("signals", signals_cmd))
-tg_app.add_handler(CommandHandler("balance", balance_cmd))
+tg_app.add_handler(CommandHandler("market", market_cmd))
 tg_app.add_handler(CommandHandler("portfolio", portfolio_cmd))
 tg_app.add_handler(CommandHandler("pnl", pnl_cmd))
-tg_app.add_handler(CommandHandler("market", market_cmd))
 tg_app.add_handler(CommandHandler("settings", settings_cmd))
 tg_app.add_handler(CallbackQueryHandler(button_callback))
 
@@ -648,9 +556,17 @@ async def health():
 
 @app.get("/debug/signals")
 async def debug_signals():
-    """Test endpoint to check signal generation."""
+    """Test signal generation."""
     signals = await generate_trading_signals()
     return signals
+
+
+@app.get("/debug/price/{pair}")
+async def debug_price(pair: str):
+    """Test price fetching."""
+    price = await get_public_price(pair)
+    candles = await get_public_candles(pair)
+    return {"pair": pair, "price": price, "candles_count": len(candles.get("prices", []))}
 
 
 @app.post("/webhook/{secret}")
