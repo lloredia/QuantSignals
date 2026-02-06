@@ -4,3 +4,5 @@ python-telegram-bot
 openai
 httpx
 pytz
+PyJWT
+cryptography
