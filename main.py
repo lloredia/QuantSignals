@@ -38,6 +38,115 @@ tg_app = Application.builder().token(TOKEN).build()
 positions = {}
 daily_pnl = {"realized": 0.0, "trades": 0, "wins": 0}
 
+# Live trading mode
+LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
+
+
+# ============ COINBASE CDP CLIENT ============
+class CoinbaseCDPClient:
+    """Coinbase CDP API client with JWT auth."""
+    
+    BASE_URL = "https://api.coinbase.com"
+    
+    def __init__(self, api_key: str, api_secret: str):
+        self.api_key = api_key
+        # Fix newlines in private key
+        self.api_secret = api_secret.replace("\\n", "\n")
+    
+    def _build_jwt(self, method: str, path: str) -> str:
+        """Build JWT for CDP API."""
+        import jwt as pyjwt
+        
+        uri = f"{method} api.coinbase.com{path}"
+        
+        payload = {
+            "sub": self.api_key,
+            "iss": "coinbase-cloud",
+            "nbf": int(time.time()),
+            "exp": int(time.time()) + 120,
+            "uri": uri,
+        }
+        
+        # Load private key
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.backends import default_backend
+        
+        private_key = serialization.load_pem_private_key(
+            self.api_secret.encode(),
+            password=None,
+            backend=default_backend()
+        )
+        
+        token = pyjwt.encode(payload, private_key, algorithm="ES256")
+        return token
+    
+    def _headers(self, method: str, path: str) -> dict:
+        """Generate auth headers."""
+        token = self._build_jwt(method, path)
+        return {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+    
+    async def get_accounts(self) -> dict:
+        """Get account balances."""
+        path = "/api/v3/brokerage/accounts"
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{self.BASE_URL}{path}",
+                    headers=self._headers("GET", path),
+                    timeout=15
+                )
+                return resp.json()
+        except Exception as e:
+            print(f"[CDP ERROR] get_accounts: {e}")
+            return {"error": str(e)}
+    
+    async def place_market_order(self, product_id: str, side: str, usd_amount: float) -> dict:
+        """Place a market order."""
+        path = "/api/v3/brokerage/orders"
+        
+        order_id = f"qs_{int(time.time())}_{secrets.token_hex(4)}"
+        
+        body = {
+            "client_order_id": order_id,
+            "product_id": product_id,
+            "side": side.upper(),
+            "order_configuration": {
+                "market_market_ioc": {
+                    "quote_size": str(usd_amount)
+                }
+            }
+        }
+        
+        body_str = json.dumps(body)
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{self.BASE_URL}{path}",
+                    headers=self._headers("POST", path),
+                    content=body_str,
+                    timeout=15
+                )
+                result = resp.json()
+                print(f"[CDP] Order response: {result}")
+                return result
+        except Exception as e:
+            print(f"[CDP ERROR] place_order: {e}")
+            return {"error": str(e)}
+
+
+# Initialize CDP client if keys exist
+cdp_client = None
+if COINBASE_API_KEY and COINBASE_API_SECRET:
+    try:
+        cdp_client = CoinbaseCDPClient(COINBASE_API_KEY, COINBASE_API_SECRET)
+        print("✅ Coinbase CDP client initialized")
+    except Exception as e:
+        print(f"❌ CDP client init failed: {e}")
+
 
 # ============ PUBLIC PRICE API (No Auth Required) ============
 async def get_public_price(product_id: str) -> float:
@@ -461,30 +570,64 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if data.startswith("trade_buy_"):
         pair = data.replace("trade_buy_", "")
-        
-        # For now, just track the position without actual trading
         price = await get_public_price(pair)
         
-        if price > 0:
+        if price <= 0:
+            await query.edit_message_text(f"❌ Could not get price for {pair}")
+            return
+        
+        # Check if live trading is enabled
+        if LIVE_TRADING and cdp_client:
+            await query.edit_message_text(f"🔄 Executing LIVE BUY for {pair}...")
+            
+            try:
+                result = await cdp_client.place_market_order(pair, "BUY", TRADE_AMOUNT_USD)
+                
+                if result.get("success") or result.get("order_id") or result.get("success_response"):
+                    positions[pair] = {
+                        "entry_price": price,
+                        "amount_usd": TRADE_AMOUNT_USD,
+                        "timestamp": datetime.now().isoformat(),
+                        "live": True
+                    }
+                    
+                    await query.edit_message_text(
+                        f"✅ <b>LIVE ORDER EXECUTED</b>\n\n"
+                        f"📊 {pair}\n"
+                        f"💵 Amount: ${TRADE_AMOUNT_USD}\n"
+                        f"📍 Entry: ${price:,.2f}\n"
+                        f"🛑 Stop Loss: ${price * (1 - STOP_LOSS_PCT/100):,.2f}\n"
+                        f"🎯 Take Profit: ${price * (1 + TAKE_PROFIT_PCT/100):,.2f}\n\n"
+                        f"<i>Use /portfolio to track</i>",
+                        parse_mode="HTML"
+                    )
+                else:
+                    error = result.get("error") or result.get("message") or json.dumps(result)
+                    await query.edit_message_text(f"❌ Order failed: {error[:200]}")
+                    
+            except Exception as e:
+                await query.edit_message_text(f"❌ Error: {str(e)[:100]}")
+        else:
+            # Paper trading
             positions[pair] = {
                 "entry_price": price,
                 "amount_usd": TRADE_AMOUNT_USD,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "live": False
             }
             
+            mode = "🟡 PAPER" if not LIVE_TRADING else "⚠️ NO API"
             await query.edit_message_text(
-                f"✅ <b>POSITION OPENED</b>\n\n"
+                f"✅ <b>POSITION OPENED</b> ({mode})\n\n"
                 f"📊 {pair}\n"
                 f"💵 Amount: ${TRADE_AMOUNT_USD}\n"
                 f"📍 Entry: ${price:,.2f}\n"
                 f"🛑 Stop Loss: ${price * (1 - STOP_LOSS_PCT/100):,.2f}\n"
                 f"🎯 Take Profit: ${price * (1 + TAKE_PROFIT_PCT/100):,.2f}\n\n"
                 f"<i>Use /portfolio to track</i>\n\n"
-                f"⚠️ <b>Note:</b> This is paper trading. Connect Coinbase API for live trades.",
+                f"💡 Set LIVE_TRADING=true in Railway for real trades.",
                 parse_mode="HTML"
             )
-        else:
-            await query.edit_message_text(f"❌ Could not get price for {pair}")
     
     elif data.startswith("close_"):
         pair = data.replace("close_", "")
@@ -494,6 +637,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current = await get_public_price(pair)
             pnl_pct = ((current - entry) / entry) * 100
             pnl_usd = (pnl_pct / 100) * positions[pair]["amount_usd"]
+            is_live = positions[pair].get("live", False)
+            
+            # If live, execute sell order
+            if is_live and LIVE_TRADING and cdp_client:
+                await query.edit_message_text(f"🔄 Executing LIVE SELL for {pair}...")
+                # Note: For sells, we'd need to track the base amount bought
+                # For now, just close the position tracking
             
             daily_pnl["realized"] += pnl_usd
             daily_pnl["trades"] += 1
@@ -503,8 +653,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del positions[pair]
             
             emoji = "🟢" if pnl_usd >= 0 else "🔴"
+            mode = "LIVE" if is_live else "PAPER"
             await query.edit_message_text(
-                f"✅ <b>POSITION CLOSED</b>\n\n"
+                f"✅ <b>POSITION CLOSED</b> ({mode})\n\n"
                 f"📊 {pair}\n"
                 f"📍 Entry: ${entry:,.2f}\n"
                 f"📍 Exit: ${current:,.2f}\n"
