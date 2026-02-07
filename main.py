@@ -184,12 +184,58 @@ MIN_EXPECTED_VALUE = float(os.getenv("MIN_EXPECTED_VALUE", "1.5"))  # Min 1.5% E
 # Kelly Criterion
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))  # Use 25% Kelly for safety
 
-# Expanded coin list
-TRADING_PAIRS = [
-    "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "LINK-USD",
-    "DOGE-USD", "XRP-USD", "ADA-USD", "MATIC-USD", "DOT-USD",
-    "ATOM-USD", "UNI-USD", "AAVE-USD", "LTC-USD", "NEAR-USD"
-]
+# ============ MULTI-ASSET CONFIGURATION ============
+# Alpaca API (for stocks)
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")  # paper or live
+
+# Asset Classes
+ASSET_CLASSES = {
+    "crypto": {
+        "enabled": True,
+        "provider": "coinbase",
+        "pairs": [
+            "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "LINK-USD",
+            "DOGE-USD", "XRP-USD", "ADA-USD", "MATIC-USD", "DOT-USD",
+            "ATOM-USD", "UNI-USD", "AAVE-USD", "LTC-USD", "NEAR-USD"
+        ],
+        "trading_hours": "24/7",
+        "min_trade": 1,
+    },
+    "stocks": {
+        "enabled": bool(ALPACA_API_KEY),
+        "provider": "alpaca",
+        "symbols": [
+            # Mega Cap Tech
+            "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
+            # Financials
+            "JPM", "BAC", "V", "MA",
+            # ETFs
+            "SPY", "QQQ", "IWM", "DIA",
+            # High Volume
+            "AMD", "INTC", "NFLX", "CRM", "PYPL"
+        ],
+        "trading_hours": "9:30-16:00 ET",
+        "min_trade": 1,
+    },
+    "forex": {
+        "enabled": bool(ALPACA_API_KEY),  # Alpaca supports forex
+        "provider": "alpaca",
+        "pairs": [
+            "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
+            "AUD/USD", "USD/CAD", "NZD/USD",
+            "EUR/GBP", "EUR/JPY", "GBP/JPY"
+        ],
+        "trading_hours": "24/5",  # Sun 5pm - Fri 5pm ET
+        "min_trade": 100,
+    }
+}
+
+# Legacy support
+TRADING_PAIRS = ASSET_CLASSES["crypto"]["pairs"]
+STOCK_SYMBOLS = ASSET_CLASSES["stocks"]["symbols"]
+FOREX_PAIRS = ASSET_CLASSES["forex"]["pairs"]
 
 # Strategy Types
 STRATEGY_TYPES = [
@@ -458,6 +504,207 @@ if COINBASE_API_KEY and COINBASE_API_SECRET:
         print("✅ Coinbase CDP client initialized")
     except Exception as e:
         print(f"❌ CDP client init failed: {e}")
+
+
+# ============ ALPACA CLIENT (STOCKS & FOREX) ============
+class AlpacaClient:
+    """Alpaca API client for stocks and forex trading."""
+    
+    def __init__(self, api_key: str, api_secret: str, base_url: str = "https://paper-api.alpaca.markets"):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = base_url
+        self.data_url = "https://data.alpaca.markets"
+    
+    def _headers(self) -> dict:
+        return {
+            "APCA-API-KEY-ID": self.api_key,
+            "APCA-API-SECRET-KEY": self.api_secret,
+            "Content-Type": "application/json"
+        }
+    
+    async def get_account(self) -> dict:
+        """Get account info."""
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{self.base_url}/v2/account", headers=self._headers(), timeout=15)
+                return resp.json()
+        except Exception as e:
+            return {"error": str(e)}
+    
+    async def get_positions(self) -> list:
+        """Get all open positions."""
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{self.base_url}/v2/positions", headers=self._headers(), timeout=15)
+                return resp.json()
+        except Exception as e:
+            return []
+    
+    async def get_stock_price(self, symbol: str) -> float:
+        """Get latest stock price."""
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{self.data_url}/v2/stocks/{symbol}/trades/latest",
+                    headers=self._headers(),
+                    timeout=10
+                )
+                data = resp.json()
+                return float(data.get("trade", {}).get("p", 0))
+        except:
+            return 0
+    
+    async def get_stock_bars(self, symbol: str, timeframe: str = "1Hour", limit: int = 24) -> list:
+        """Get stock OHLCV bars."""
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{self.data_url}/v2/stocks/{symbol}/bars",
+                    headers=self._headers(),
+                    params={"timeframe": timeframe, "limit": limit},
+                    timeout=10
+                )
+                return resp.json().get("bars", [])
+        except:
+            return []
+    
+    async def get_forex_rate(self, pair: str) -> float:
+        """Get forex rate (e.g., EUR/USD)."""
+        # Convert EUR/USD to EURUSD format
+        symbol = pair.replace("/", "")
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{self.data_url}/v1beta1/forex/latest/rates",
+                    headers=self._headers(),
+                    params={"currency_pairs": symbol},
+                    timeout=10
+                )
+                data = resp.json()
+                rates = data.get("rates", {})
+                if symbol in rates:
+                    return float(rates[symbol].get("bp", 0))  # bid price
+        except:
+            pass
+        return 0
+    
+    async def place_stock_order(self, symbol: str, side: str, qty: float = None, notional: float = None) -> dict:
+        """Place stock market order."""
+        body = {
+            "symbol": symbol,
+            "side": side.lower(),
+            "type": "market",
+            "time_in_force": "day"
+        }
+        if qty:
+            body["qty"] = str(qty)
+        elif notional:
+            body["notional"] = str(notional)  # Dollar amount
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{self.base_url}/v2/orders",
+                    headers=self._headers(),
+                    json=body,
+                    timeout=15
+                )
+                return resp.json()
+        except Exception as e:
+            return {"error": str(e)}
+    
+    async def get_buying_power(self) -> float:
+        """Get available buying power."""
+        try:
+            account = await self.get_account()
+            return float(account.get("buying_power", 0))
+        except:
+            return 0
+    
+    async def get_portfolio_value(self) -> float:
+        """Get total portfolio value."""
+        try:
+            account = await self.get_account()
+            return float(account.get("portfolio_value", 0))
+        except:
+            return 0
+    
+    async def is_market_open(self) -> bool:
+        """Check if stock market is open."""
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{self.base_url}/v2/clock", headers=self._headers(), timeout=10)
+                return resp.json().get("is_open", False)
+        except:
+            return False
+    
+    async def get_all_holdings(self) -> dict:
+        """Get all stock/forex holdings."""
+        holdings = {
+            "cash": 0,
+            "portfolio_value": 0,
+            "assets": []
+        }
+        
+        try:
+            account = await self.get_account()
+            holdings["cash"] = float(account.get("cash", 0))
+            holdings["portfolio_value"] = float(account.get("portfolio_value", 0))
+            
+            positions = await self.get_positions()
+            for pos in positions:
+                holdings["assets"].append({
+                    "symbol": pos.get("symbol"),
+                    "qty": float(pos.get("qty", 0)),
+                    "market_value": float(pos.get("market_value", 0)),
+                    "avg_entry": float(pos.get("avg_entry_price", 0)),
+                    "current_price": float(pos.get("current_price", 0)),
+                    "unrealized_pl": float(pos.get("unrealized_pl", 0)),
+                    "unrealized_plpc": float(pos.get("unrealized_plpc", 0)) * 100
+                })
+            
+            holdings["assets"] = sorted(holdings["assets"], key=lambda x: x["market_value"], reverse=True)
+        except Exception as e:
+            print(f"[ALPACA] Holdings error: {e}")
+        
+        return holdings
+
+
+# Initialize Alpaca client
+alpaca_client = None
+if ALPACA_API_KEY and ALPACA_API_SECRET:
+    try:
+        alpaca_client = AlpacaClient(ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_BASE_URL)
+        print("✅ Alpaca client initialized")
+    except Exception as e:
+        print(f"❌ Alpaca client init failed: {e}")
+
+
+# ============ UNIFIED PRICE GETTER ============
+async def get_asset_price(symbol: str, asset_class: str = "auto") -> float:
+    """Get price for any asset class."""
+    
+    # Auto-detect asset class
+    if asset_class == "auto":
+        if "-USD" in symbol or symbol in ["BTC", "ETH", "SOL"]:
+            asset_class = "crypto"
+        elif "/" in symbol:
+            asset_class = "forex"
+        else:
+            asset_class = "stocks"
+    
+    if asset_class == "crypto":
+        pair = symbol if "-USD" in symbol else f"{symbol}-USD"
+        return await get_public_price(pair)
+    
+    elif asset_class == "stocks" and alpaca_client:
+        return await alpaca_client.get_stock_price(symbol)
+    
+    elif asset_class == "forex" and alpaca_client:
+        return await alpaca_client.get_forex_rate(symbol)
+    
+    return 0
 
 
 # ============ PUBLIC PRICE APIs ============
@@ -1103,34 +1350,32 @@ async def run_backtest(pair: str, days: int = 30) -> dict:
 # ============ TELEGRAM COMMANDS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome = """🚀 <b>QUANTSIGNALS ULTRA</b>
-<i>Elite Quantitative Trading Intelligence</i>
+<i>Multi-Asset Trading Intelligence</i>
 
 ═══════════════════════════════════
 
-<b>💰 TRADING</b>
-/buy [coin] [amt] - Quick buy
-/sell [coin] [%] - Quick sell  
-/limit [coin] [price] - Limit alert
-/signals - AI quantitative signals
+<b>🪙 CRYPTO</b>
+/buy [coin] [amt] - Buy crypto
+/sell [coin] [%] - Sell crypto
+/signals - AI crypto signals
+/portfolio - Crypto holdings
 
-<b>📊 PORTFOLIO</b>
-/portfolio - All holdings + P&L
-/pnl - Today's P&L
-/history - Trade history
+<b>📈 STOCKS</b>
+/stocks - Stock market overview
+/stockbuy [sym] [amt] - Buy stocks
+/stocksell [sym] - Sell stocks
+
+<b>💱 FOREX</b>
+/forex - Forex rates
+
+<b>🌐 MULTI-ASSET</b>
+/all - Combined portfolio
 /performance - Full report
 
-<b>📈 ANALYSIS</b>
-/regime - Market regime
-/fear - Fear & Greed Index
-/news - Crypto news
-/tf [coin] - Multi-timeframe
-/whale - Whale alerts
-
 <b>🤖 AUTOPILOT</b>
-/autopilot - Auto trading control
+/autopilot - Auto trading
 /dcaauto - DCA autopilot
 /tptiers - Take profit tiers
-/pause - Pause trading
 
 <b>🛡️ RISK</b>
 /risk - Risk dashboard
@@ -1138,24 +1383,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 <b>📊 ANALYTICS</b>
 /chart - P&L chart
-/streak - Win/loss streak
-/besttrades - Best & worst trades
+/streak - Win streak
+/besttrades - Best trades
 /summary - Daily summary
 
 <b>⚙️ TOOLS</b>
-/menu - Interactive menu
+/menu - Button menu
 /market - Live prices
-/alerts - View alerts
-/backtest - Backtest strategy
-/settings - Bot settings
+/fear - Fear & Greed
+/settings - Settings
 
 ═══════════════════════════════════
-<i>Capital Preservation → Consistency → Compounding</i>"""
+<i>Crypto • Stocks • Forex</i>"""
     
     keyboard = [
-        [InlineKeyboardButton("📊 Signals", callback_data="menu_signals"), InlineKeyboardButton("💼 Portfolio", callback_data="menu_portfolio")],
-        [InlineKeyboardButton("🤖 Autopilot", callback_data="menu_autopilot"), InlineKeyboardButton("🛡️ Risk", callback_data="menu_risk")],
-        [InlineKeyboardButton("📈 Full Menu", callback_data="menu_back")]
+        [InlineKeyboardButton("🪙 Crypto", callback_data="menu_portfolio"), InlineKeyboardButton("📈 Stocks", callback_data="menu_stocks")],
+        [InlineKeyboardButton("💱 Forex", callback_data="menu_forex"), InlineKeyboardButton("🌐 All Assets", callback_data="all_portfolio")],
+        [InlineKeyboardButton("🤖 Autopilot", callback_data="menu_autopilot"), InlineKeyboardButton("📊 Menu", callback_data="menu_back")]
     ]
     
     await update.message.reply_text(welcome, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1733,6 +1977,306 @@ async def market_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += "\n<i>/signals for AI analysis</i>"
     
     await msg.edit_text(text, parse_mode="HTML")
+
+
+# ============ STOCKS COMMANDS ============
+async def stocks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show stock market overview."""
+    if not alpaca_client:
+        await update.message.reply_text(
+            "📈 <b>STOCKS</b>\n\n"
+            "❌ Alpaca not configured.\n\n"
+            "Add to Railway:\n"
+            "<code>ALPACA_API_KEY=your_key</code>\n"
+            "<code>ALPACA_API_SECRET=your_secret</code>\n\n"
+            "Get free keys at: alpaca.markets",
+            parse_mode="HTML"
+        )
+        return
+    
+    msg = await update.message.reply_text("📈 Loading stocks...")
+    
+    # Check market status
+    market_open = await alpaca_client.is_market_open()
+    status = "🟢 OPEN" if market_open else "🔴 CLOSED"
+    
+    # Get prices for top stocks
+    text = f"""📈 <b>STOCK MARKET</b>
+━━━━━━━━━━━━━━━━━━━━━
+Market: {status}
+
+<b>Tech Giants:</b>
+"""
+    
+    tech_stocks = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
+    for symbol in tech_stocks:
+        price = await alpaca_client.get_stock_price(symbol)
+        if price > 0:
+            text += f"📊 <b>{symbol}</b>: ${price:,.2f}\n"
+    
+    text += "\n<b>ETFs:</b>\n"
+    etfs = ["SPY", "QQQ", "IWM"]
+    for symbol in etfs:
+        price = await alpaca_client.get_stock_price(symbol)
+        if price > 0:
+            text += f"📊 <b>{symbol}</b>: ${price:,.2f}\n"
+    
+    # Show buying power if available
+    buying_power = await alpaca_client.get_buying_power()
+    if buying_power > 0:
+        text += f"\n💵 Buying Power: ${buying_power:,.2f}"
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 Stock Signals", callback_data="stock_signals")],
+        [InlineKeyboardButton("💼 Stock Portfolio", callback_data="stock_portfolio")],
+        [InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+    ]
+    
+    await msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def stockbuy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buy stocks: /stockbuy AAPL 100"""
+    if not alpaca_client:
+        await update.message.reply_text("❌ Alpaca not configured")
+        return
+    
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "📈 <b>BUY STOCKS</b>\n\n"
+            "Usage:\n"
+            "<code>/stockbuy AAPL</code> - Buy with default $\n"
+            "<code>/stockbuy AAPL 100</code> - Buy $100 of AAPL\n"
+            "<code>/stockbuy TSLA 500</code> - Buy $500 of TSLA",
+            parse_mode="HTML"
+        )
+        return
+    
+    symbol = args[0].upper()
+    amount = float(args[1]) if len(args) > 1 else TRADE_AMOUNT_USD
+    
+    # Check if valid stock
+    if symbol not in STOCK_SYMBOLS:
+        await update.message.reply_text(f"❌ Unknown stock. Available: {', '.join(STOCK_SYMBOLS[:10])}...")
+        return
+    
+    # Check market hours
+    market_open = await alpaca_client.is_market_open()
+    if not market_open:
+        await update.message.reply_text("❌ Market is closed. Try during market hours (9:30 AM - 4:00 PM ET)")
+        return
+    
+    price = await alpaca_client.get_stock_price(symbol)
+    shares = amount / price if price > 0 else 0
+    
+    keyboard = [
+        [InlineKeyboardButton(f"✅ Buy ${amount} of {symbol}", callback_data=f"confirm_stockbuy_{symbol}_{amount}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_order")]
+    ]
+    
+    await update.message.reply_text(
+        f"📈 <b>CONFIRM STOCK BUY</b>\n\n"
+        f"📊 Symbol: <b>{symbol}</b>\n"
+        f"💵 Amount: <b>${amount:.2f}</b>\n"
+        f"💲 Price: ${price:,.2f}\n"
+        f"📈 Shares: ~{shares:.4f}\n\n"
+        f"Mode: {'🔴 LIVE' if LIVE_TRADING else '🟡 PAPER'}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def stocksell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sell stocks: /stocksell AAPL"""
+    if not alpaca_client:
+        await update.message.reply_text("❌ Alpaca not configured")
+        return
+    
+    args = context.args
+    
+    # Show holdings if no args
+    if not args:
+        holdings = await alpaca_client.get_all_holdings()
+        
+        if not holdings["assets"]:
+            await update.message.reply_text("📭 No stock positions to sell")
+            return
+        
+        text = "📉 <b>SELL STOCKS</b>\n━━━━━━━━━━━━━━━\n\n"
+        keyboard = []
+        
+        for asset in holdings["assets"][:8]:
+            symbol = asset["symbol"]
+            value = asset["market_value"]
+            pl = asset["unrealized_pl"]
+            pl_pct = asset["unrealized_plpc"]
+            emoji = "🟢" if pl >= 0 else "🔴"
+            
+            text += f"{emoji} <b>{symbol}</b>: ${value:,.2f} ({pl_pct:+.1f}%)\n"
+            keyboard.append([InlineKeyboardButton(f"Sell {symbol}", callback_data=f"stocksell_menu_{symbol}")])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Menu", callback_data="menu_back")])
+        
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    
+    symbol = args[0].upper()
+    sell_pct = float(args[1]) if len(args) > 1 else 100
+    
+    # Get position
+    holdings = await alpaca_client.get_all_holdings()
+    position = next((a for a in holdings["assets"] if a["symbol"] == symbol), None)
+    
+    if not position:
+        await update.message.reply_text(f"❌ No position in {symbol}")
+        return
+    
+    sell_qty = position["qty"] * (sell_pct / 100)
+    sell_value = position["market_value"] * (sell_pct / 100)
+    
+    keyboard = [
+        [InlineKeyboardButton(f"✅ Sell {sell_pct}% ({sell_qty:.2f} shares)", callback_data=f"confirm_stocksell_{symbol}_{sell_qty}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_order")]
+    ]
+    
+    await update.message.reply_text(
+        f"📉 <b>CONFIRM STOCK SELL</b>\n\n"
+        f"📊 Symbol: <b>{symbol}</b>\n"
+        f"📈 Shares: {sell_qty:.4f}\n"
+        f"💵 Value: ~${sell_value:,.2f}\n"
+        f"💲 Price: ${position['current_price']:,.2f}\n"
+        f"📊 P&L: {position['unrealized_plpc']:+.1f}%",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# ============ FOREX COMMANDS ============
+async def forex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show forex rates."""
+    if not alpaca_client:
+        await update.message.reply_text(
+            "💱 <b>FOREX</b>\n\n"
+            "❌ Alpaca not configured.\n\n"
+            "Add to Railway:\n"
+            "<code>ALPACA_API_KEY=your_key</code>\n"
+            "<code>ALPACA_API_SECRET=your_secret</code>",
+            parse_mode="HTML"
+        )
+        return
+    
+    msg = await update.message.reply_text("💱 Loading forex rates...")
+    
+    text = """💱 <b>FOREX RATES</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+<b>Major Pairs:</b>
+"""
+    
+    major_pairs = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF"]
+    for pair in major_pairs:
+        rate = await alpaca_client.get_forex_rate(pair)
+        if rate > 0:
+            text += f"💱 <b>{pair}</b>: {rate:.5f}\n"
+    
+    text += "\n<b>Commodity Pairs:</b>\n"
+    commodity_pairs = ["AUD/USD", "USD/CAD", "NZD/USD"]
+    for pair in commodity_pairs:
+        rate = await alpaca_client.get_forex_rate(pair)
+        if rate > 0:
+            text += f"💱 <b>{pair}</b>: {rate:.5f}\n"
+    
+    text += "\n<b>Cross Pairs:</b>\n"
+    cross_pairs = ["EUR/GBP", "EUR/JPY", "GBP/JPY"]
+    for pair in cross_pairs:
+        rate = await alpaca_client.get_forex_rate(pair)
+        if rate > 0:
+            text += f"💱 <b>{pair}</b>: {rate:.5f}\n"
+    
+    text += "\n<i>Forex trades 24/5 (Sun 5pm - Fri 5pm ET)</i>"
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 Forex Signals", callback_data="forex_signals")],
+        [InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+    ]
+    
+    await msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ============ MULTI-ASSET PORTFOLIO ============
+async def allportfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show combined portfolio across all asset classes."""
+    msg = await update.message.reply_text("📊 Loading all assets...")
+    
+    # Get crypto holdings
+    crypto_value = 0
+    crypto_assets = []
+    if cdp_client:
+        holdings = await cdp_client.get_all_holdings()
+        crypto_value = holdings.get("crypto_value", 0)
+        crypto_assets = holdings.get("assets", [])
+    
+    # Get stock holdings
+    stock_value = 0
+    stock_assets = []
+    stock_cash = 0
+    if alpaca_client:
+        holdings = await alpaca_client.get_all_holdings()
+        stock_value = holdings.get("portfolio_value", 0) - holdings.get("cash", 0)
+        stock_cash = holdings.get("cash", 0)
+        stock_assets = holdings.get("assets", [])
+    
+    total_value = crypto_value + stock_value + stock_cash
+    
+    text = f"""
+╔═══════════════════════════════════════╗
+║    🌐 <b>MULTI-ASSET PORTFOLIO</b>          ║
+╠═══════════════════════════════════════╣
+║                                       ║
+║  💰 <b>Total:</b> <code>${total_value:,.2f}</code>               ║
+║                                       ║
+╠═══════════════════════════════════════╣
+║  <b>BY ASSET CLASS</b>                      ║
+╠═══════════════════════════════════════╣
+"""
+    
+    if crypto_value > 0:
+        crypto_pct = (crypto_value / total_value * 100) if total_value > 0 else 0
+        text += f"║  🪙 Crypto:  <code>${crypto_value:,.2f}</code> ({crypto_pct:.1f}%)     ║\n"
+    
+    if stock_value > 0:
+        stock_pct = (stock_value / total_value * 100) if total_value > 0 else 0
+        text += f"║  📈 Stocks:  <code>${stock_value:,.2f}</code> ({stock_pct:.1f}%)     ║\n"
+    
+    if stock_cash > 0:
+        cash_pct = (stock_cash / total_value * 100) if total_value > 0 else 0
+        text += f"║  💵 Cash:    <code>${stock_cash:,.2f}</code> ({cash_pct:.1f}%)     ║\n"
+    
+    text += "╚═══════════════════════════════════════╝\n"
+    
+    # Top holdings across all
+    text += "\n<b>🏆 TOP HOLDINGS</b>\n"
+    
+    all_assets = []
+    for a in crypto_assets[:5]:
+        all_assets.append({"symbol": a["currency"], "value": a["value"], "type": "🪙"})
+    for a in stock_assets[:5]:
+        all_assets.append({"symbol": a["symbol"], "value": a["market_value"], "type": "📈"})
+    
+    all_assets.sort(key=lambda x: x["value"], reverse=True)
+    
+    for asset in all_assets[:8]:
+        pct = (asset["value"] / total_value * 100) if total_value > 0 else 0
+        bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+        text += f"{asset['type']} <b>{asset['symbol']}</b>: ${asset['value']:,.2f} ({pct:.1f}%)\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("🪙 Crypto", callback_data="menu_portfolio"), InlineKeyboardButton("📈 Stocks", callback_data="stock_portfolio")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="all_portfolio"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+    ]
+    
+    await msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3055,6 +3599,281 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="menu_market"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
     
+    elif data == "menu_stocks":
+        if not alpaca_client:
+            text = "📈 <b>STOCKS</b>\n\n❌ Alpaca not configured.\n\nAdd to Railway:\n<code>ALPACA_API_KEY</code>\n<code>ALPACA_API_SECRET</code>"
+            keyboard = [[InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
+        else:
+            market_open = await alpaca_client.is_market_open()
+            status = "🟢 OPEN" if market_open else "🔴 CLOSED"
+            
+            text = f"📈 <b>STOCK MARKET</b>\n━━━━━━━━━━━━━━━\nStatus: {status}\n\n<b>Tech:</b>\n"
+            
+            for sym in ["AAPL", "MSFT", "NVDA", "GOOGL", "TSLA"]:
+                price = await alpaca_client.get_stock_price(sym)
+                if price > 0:
+                    text += f"📊 <b>{sym}</b>: ${price:,.2f}\n"
+            
+            text += "\n<b>ETFs:</b>\n"
+            for sym in ["SPY", "QQQ"]:
+                price = await alpaca_client.get_stock_price(sym)
+                if price > 0:
+                    text += f"📊 <b>{sym}</b>: ${price:,.2f}\n"
+            
+            buying_power = await alpaca_client.get_buying_power()
+            text += f"\n💵 Buying Power: ${buying_power:,.2f}"
+            
+            keyboard = [
+                [InlineKeyboardButton("💰 Buy Stock", callback_data="stock_buy_menu"), InlineKeyboardButton("💸 Sell Stock", callback_data="stock_sell_menu")],
+                [InlineKeyboardButton("💼 Stock Portfolio", callback_data="stock_portfolio")],
+                [InlineKeyboardButton("🔄 Refresh", callback_data="menu_stocks"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+            ]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_forex":
+        if not alpaca_client:
+            text = "💱 <b>FOREX</b>\n\n❌ Alpaca not configured.\n\nAdd to Railway:\n<code>ALPACA_API_KEY</code>\n<code>ALPACA_API_SECRET</code>"
+            keyboard = [[InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
+        else:
+            text = "💱 <b>FOREX RATES</b>\n━━━━━━━━━━━━━━━\n\n<b>Major Pairs:</b>\n"
+            
+            for pair in ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF"]:
+                rate = await alpaca_client.get_forex_rate(pair)
+                if rate > 0:
+                    text += f"💱 <b>{pair}</b>: {rate:.5f}\n"
+            
+            text += "\n<b>Commodity:</b>\n"
+            for pair in ["AUD/USD", "USD/CAD", "NZD/USD"]:
+                rate = await alpaca_client.get_forex_rate(pair)
+                if rate > 0:
+                    text += f"💱 <b>{pair}</b>: {rate:.5f}\n"
+            
+            text += "\n<i>24/5 (Sun 5pm - Fri 5pm ET)</i>"
+            
+            keyboard = [
+                [InlineKeyboardButton("🔄 Refresh", callback_data="menu_forex"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+            ]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "stock_portfolio":
+        if not alpaca_client:
+            await query.edit_message_text("❌ Alpaca not configured")
+            return
+        
+        holdings = await alpaca_client.get_all_holdings()
+        
+        text = f"💼 <b>STOCK PORTFOLIO</b>\n━━━━━━━━━━━━━━━\n\n"
+        text += f"💰 Portfolio: <b>${holdings['portfolio_value']:,.2f}</b>\n"
+        text += f"💵 Cash: ${holdings['cash']:,.2f}\n\n"
+        
+        if holdings["assets"]:
+            text += "<b>Positions:</b>\n"
+            for asset in holdings["assets"][:8]:
+                emoji = "🟢" if asset["unrealized_pl"] >= 0 else "🔴"
+                text += f"{emoji} <b>{asset['symbol']}</b>: ${asset['market_value']:,.2f} ({asset['unrealized_plpc']:+.1f}%)\n"
+        else:
+            text += "<i>No positions</i>"
+        
+        keyboard = [
+            [InlineKeyboardButton("💰 Buy", callback_data="stock_buy_menu"), InlineKeyboardButton("💸 Sell", callback_data="stock_sell_menu")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="stock_portfolio"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+        ]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "stock_buy_menu":
+        text = "💰 <b>BUY STOCKS</b>\n━━━━━━━━━━━━━━━\n\nSelect stock:"
+        keyboard = [
+            [InlineKeyboardButton("AAPL", callback_data="stockbuy_AAPL"), InlineKeyboardButton("MSFT", callback_data="stockbuy_MSFT"), InlineKeyboardButton("NVDA", callback_data="stockbuy_NVDA")],
+            [InlineKeyboardButton("GOOGL", callback_data="stockbuy_GOOGL"), InlineKeyboardButton("AMZN", callback_data="stockbuy_AMZN"), InlineKeyboardButton("TSLA", callback_data="stockbuy_TSLA")],
+            [InlineKeyboardButton("SPY", callback_data="stockbuy_SPY"), InlineKeyboardButton("QQQ", callback_data="stockbuy_QQQ"), InlineKeyboardButton("META", callback_data="stockbuy_META")],
+            [InlineKeyboardButton("🔙 Back", callback_data="menu_stocks")]
+        ]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data.startswith("stockbuy_"):
+        symbol = data.replace("stockbuy_", "")
+        price = await alpaca_client.get_stock_price(symbol)
+        
+        keyboard = [
+            [InlineKeyboardButton("$25", callback_data=f"confirm_stockbuy_{symbol}_25"), InlineKeyboardButton("$50", callback_data=f"confirm_stockbuy_{symbol}_50")],
+            [InlineKeyboardButton("$100", callback_data=f"confirm_stockbuy_{symbol}_100"), InlineKeyboardButton("$250", callback_data=f"confirm_stockbuy_{symbol}_250")],
+            [InlineKeyboardButton("🔙 Back", callback_data="stock_buy_menu")]
+        ]
+        
+        await query.edit_message_text(
+            f"💰 <b>BUY {symbol}</b>\n\n"
+            f"Price: ${price:,.2f}\n\n"
+            f"Select amount:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif data.startswith("confirm_stockbuy_"):
+        parts = data.replace("confirm_stockbuy_", "").split("_")
+        symbol = parts[0]
+        amount = float(parts[1])
+        
+        market_open = await alpaca_client.is_market_open()
+        if not market_open:
+            await query.edit_message_text("❌ Market is closed. Try during market hours (9:30 AM - 4:00 PM ET)")
+            return
+        
+        result = await alpaca_client.place_stock_order(symbol, "buy", notional=amount)
+        
+        if "id" in result:
+            price = await alpaca_client.get_stock_price(symbol)
+            await query.edit_message_text(
+                f"✅ <b>STOCK ORDER PLACED</b>\n\n"
+                f"📊 {symbol}\n"
+                f"💵 ${amount:.2f}\n"
+                f"💲 ~${price:,.2f}/share\n\n"
+                f"Order ID: <code>{result['id'][:8]}...</code>",
+                parse_mode="HTML"
+            )
+        else:
+            error = result.get("message", result.get("error", "Unknown error"))
+            await query.edit_message_text(f"❌ Order failed: {error}")
+    
+    elif data == "stock_sell_menu":
+        if not alpaca_client:
+            await query.edit_message_text("❌ Alpaca not configured")
+            return
+        
+        holdings = await alpaca_client.get_all_holdings()
+        
+        if not holdings["assets"]:
+            await query.edit_message_text("📭 No stock positions to sell")
+            return
+        
+        text = "💸 <b>SELL STOCKS</b>\n━━━━━━━━━━━━━━━\n\n"
+        keyboard = []
+        
+        for asset in holdings["assets"][:6]:
+            symbol = asset["symbol"]
+            value = asset["market_value"]
+            pl_pct = asset["unrealized_plpc"]
+            emoji = "🟢" if pl_pct >= 0 else "🔴"
+            text += f"{emoji} <b>{symbol}</b>: ${value:,.2f} ({pl_pct:+.1f}%)\n"
+            keyboard.append([InlineKeyboardButton(f"Sell {symbol}", callback_data=f"stocksell_menu_{symbol}")])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="menu_stocks")])
+        
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data.startswith("stocksell_menu_"):
+        symbol = data.replace("stocksell_menu_", "")
+        
+        holdings = await alpaca_client.get_all_holdings()
+        position = next((a for a in holdings["assets"] if a["symbol"] == symbol), None)
+        
+        if not position:
+            await query.edit_message_text(f"❌ No position in {symbol}")
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton("25%", callback_data=f"confirm_stocksell_{symbol}_25"), InlineKeyboardButton("50%", callback_data=f"confirm_stocksell_{symbol}_50")],
+            [InlineKeyboardButton("75%", callback_data=f"confirm_stocksell_{symbol}_75"), InlineKeyboardButton("100%", callback_data=f"confirm_stocksell_{symbol}_100")],
+            [InlineKeyboardButton("🔙 Back", callback_data="stock_sell_menu")]
+        ]
+        
+        await query.edit_message_text(
+            f"💸 <b>SELL {symbol}</b>\n\n"
+            f"Shares: {position['qty']:.4f}\n"
+            f"Value: ${position['market_value']:,.2f}\n"
+            f"P&L: {position['unrealized_plpc']:+.1f}%\n\n"
+            f"How much to sell?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif data.startswith("confirm_stocksell_"):
+        parts = data.replace("confirm_stocksell_", "").split("_")
+        symbol = parts[0]
+        sell_pct = float(parts[1])
+        
+        market_open = await alpaca_client.is_market_open()
+        if not market_open:
+            await query.edit_message_text("❌ Market is closed")
+            return
+        
+        holdings = await alpaca_client.get_all_holdings()
+        position = next((a for a in holdings["assets"] if a["symbol"] == symbol), None)
+        
+        if not position:
+            await query.edit_message_text(f"❌ No position in {symbol}")
+            return
+        
+        sell_qty = position["qty"] * (sell_pct / 100)
+        
+        result = await alpaca_client.place_stock_order(symbol, "sell", qty=sell_qty)
+        
+        if "id" in result:
+            await query.edit_message_text(
+                f"✅ <b>SELL ORDER PLACED</b>\n\n"
+                f"📊 {symbol}\n"
+                f"📈 {sell_qty:.4f} shares ({sell_pct}%)\n"
+                f"💵 ~${position['market_value'] * sell_pct / 100:,.2f}\n\n"
+                f"Order ID: <code>{result['id'][:8]}...</code>",
+                parse_mode="HTML"
+            )
+        else:
+            error = result.get("message", result.get("error", "Unknown error"))
+            await query.edit_message_text(f"❌ Order failed: {error}")
+    
+    elif data == "all_portfolio":
+        await query.edit_message_text("📊 Loading all assets...")
+        
+        # Crypto
+        crypto_value = 0
+        crypto_assets = []
+        if cdp_client:
+            holdings = await cdp_client.get_all_holdings()
+            crypto_value = holdings.get("crypto_value", 0)
+            crypto_assets = holdings.get("assets", [])
+        
+        # Stocks
+        stock_value = 0
+        stock_assets = []
+        stock_cash = 0
+        if alpaca_client:
+            holdings = await alpaca_client.get_all_holdings()
+            stock_value = holdings.get("portfolio_value", 0) - holdings.get("cash", 0)
+            stock_cash = holdings.get("cash", 0)
+            stock_assets = holdings.get("assets", [])
+        
+        total = crypto_value + stock_value + stock_cash
+        
+        text = f"🌐 <b>MULTI-ASSET PORTFOLIO</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+        text += f"💰 <b>Total: ${total:,.2f}</b>\n\n"
+        
+        if crypto_value > 0:
+            pct = (crypto_value / total * 100) if total > 0 else 0
+            text += f"🪙 Crypto: ${crypto_value:,.2f} ({pct:.1f}%)\n"
+        if stock_value > 0:
+            pct = (stock_value / total * 100) if total > 0 else 0
+            text += f"📈 Stocks: ${stock_value:,.2f} ({pct:.1f}%)\n"
+        if stock_cash > 0:
+            pct = (stock_cash / total * 100) if total > 0 else 0
+            text += f"💵 Cash: ${stock_cash:,.2f} ({pct:.1f}%)\n"
+        
+        text += "\n<b>Top Holdings:</b>\n"
+        
+        all_assets = []
+        for a in crypto_assets[:3]:
+            all_assets.append({"sym": a["currency"], "val": a["value"], "type": "🪙"})
+        for a in stock_assets[:3]:
+            all_assets.append({"sym": a["symbol"], "val": a["market_value"], "type": "📈"})
+        
+        all_assets.sort(key=lambda x: x["val"], reverse=True)
+        for a in all_assets[:6]:
+            text += f"{a['type']} <b>{a['sym']}</b>: ${a['val']:,.2f}\n"
+        
+        keyboard = [
+            [InlineKeyboardButton("🪙 Crypto", callback_data="menu_portfolio"), InlineKeyboardButton("📈 Stocks", callback_data="stock_portfolio")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="all_portfolio"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+        ]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
     elif data == "menu_fear":
         fg = await get_fear_greed_index()
         value = fg["value"]
@@ -3311,13 +4130,13 @@ Daily Target: {autopilot_settings.get('daily_target_pct', 3)}%
     
     elif data == "menu_back":
         keyboard = [
-            [InlineKeyboardButton("📊 Signals", callback_data="menu_signals"), InlineKeyboardButton("💼 Portfolio", callback_data="menu_portfolio")],
-            [InlineKeyboardButton("💰 Buy", callback_data="menu_buy"), InlineKeyboardButton("💸 Sell", callback_data="menu_sell")],
-            [InlineKeyboardButton("📈 Market", callback_data="menu_market"), InlineKeyboardButton("😱 Fear/Greed", callback_data="menu_fear")],
-            [InlineKeyboardButton("🔍 Regime", callback_data="menu_regime"), InlineKeyboardButton("📰 News", callback_data="menu_news")],
-            [InlineKeyboardButton("🤖 Autopilot", callback_data="menu_autopilot"), InlineKeyboardButton("📊 Performance", callback_data="menu_performance")]
+            [InlineKeyboardButton("🪙 Crypto", callback_data="menu_portfolio"), InlineKeyboardButton("📈 Stocks", callback_data="menu_stocks")],
+            [InlineKeyboardButton("💱 Forex", callback_data="menu_forex"), InlineKeyboardButton("🌐 All Assets", callback_data="all_portfolio")],
+            [InlineKeyboardButton("📊 Signals", callback_data="menu_signals"), InlineKeyboardButton("📈 Market", callback_data="menu_market")],
+            [InlineKeyboardButton("🤖 Autopilot", callback_data="menu_autopilot"), InlineKeyboardButton("🛡️ Risk", callback_data="menu_risk")],
+            [InlineKeyboardButton("😱 Fear/Greed", callback_data="menu_fear"), InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")]
         ]
-        await query.edit_message_text("🚀 <b>QUANTSIGNALS ULTRA</b>\n\nSelect an option:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text("🚀 <b>QUANTSIGNALS ULTRA</b>\n<i>Crypto • Stocks • Forex</i>\n\nSelect an option:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
     
     elif data.startswith("quickbuy_"):
         coin = data.replace("quickbuy_", "")
@@ -3867,10 +4686,13 @@ tg_app.add_handler(CommandHandler("summary", summary_cmd))
 tg_app.add_handler(CommandHandler("chart", chart_cmd))
 tg_app.add_handler(CommandHandler("streak", streak_cmd))
 tg_app.add_handler(CommandHandler("besttrades", besttrades_cmd))
-tg_app.add_handler(CommandHandler("news", news_cmd))
-tg_app.add_handler(CommandHandler("whale", whale_cmd))
-tg_app.add_handler(CommandHandler("timeframe", timeframe_cmd))
-tg_app.add_handler(CommandHandler("tf", timeframe_cmd))
+# Stocks & Forex commands
+tg_app.add_handler(CommandHandler("stocks", stocks_cmd))
+tg_app.add_handler(CommandHandler("stockbuy", stockbuy_cmd))
+tg_app.add_handler(CommandHandler("stocksell", stocksell_cmd))
+tg_app.add_handler(CommandHandler("forex", forex_cmd))
+tg_app.add_handler(CommandHandler("allportfolio", allportfolio_cmd))
+tg_app.add_handler(CommandHandler("all", allportfolio_cmd))
 tg_app.add_handler(CommandHandler("backtest", backtest_cmd))
 tg_app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
 tg_app.add_handler(CommandHandler("alert", alert_cmd))
