@@ -1,171 +1,107 @@
-<p align="center">
-  <h1 align="center">🤖 QuantSignals Bot</h1>
-</p>
+# 🚀 QuantSignals Ultra
 
-<p align="center">
-  <b>AI-powered crypto day trading assistant via Telegram.</b>
-</p>
+**Elite Quantitative Crypto Trading Bot for Telegram**
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.11+-blue?logo=python" alt="Python"/>
-  <img src="https://img.shields.io/badge/FastAPI-0.100+-green?logo=fastapi" alt="FastAPI"/>
-  <img src="https://img.shields.io/badge/Telegram-Bot-blue?logo=telegram" alt="Telegram"/>
-  <img src="https://img.shields.io/badge/Coinbase-API-blue?logo=coinbase" alt="Coinbase"/>
-  <img src="https://img.shields.io/badge/OpenAI-GPT--4o-green?logo=openai" alt="OpenAI"/>
-</p>
+[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
+[![Telegram](https://img.shields.io/badge/Telegram-Bot-blue.svg)](https://core.telegram.org/bots)
+[![Coinbase](https://img.shields.io/badge/Coinbase-CDP-blue.svg)](https://docs.cdp.coinbase.com/)
 
 ---
 
-## 📋 Overview
+## ✨ Features
 
-QuantSignals Bot is an AI-powered Telegram bot that generates trading signals and executes trades on Coinbase. It uses GPT-4o to analyze market data and provide day trading recommendations.
+### Trading
+- **15 Trading Pairs**: BTC, ETH, SOL, AVAX, LINK, DOGE, XRP, ADA, MATIC, DOT, ATOM, UNI, AAVE, LTC, NEAR
+- **Quick Buy/Sell**: One-tap trading with confirmation
+- **Limit Orders**: Price alerts that notify when targets hit
+- **Live Coinbase Integration**: Real trades via CDP API
 
-### Features
+### AI Signal Engine
+- **7 Quantitative Strategies**: Momentum, Mean Reversion, Volatility, Trend, Liquidity, Sentiment, Correlation
+- **Market Regime Detection**: Bull/Bear × High/Low Volatility
+- **Self-Learning Weights**: Strategies adapt based on performance
+- **Kelly Criterion Sizing**: Optimal position sizing
 
-- 🤖 **AI Trading Signals** - GPT-4o analyzes market data
-- 📊 **Real-time Market Data** - Live prices from Coinbase
-- 💰 **Auto Trade Execution** - One-click trading via Telegram
-- 📈 **P&L Tracking** - Daily profit/loss monitoring
-- 🛑 **Risk Management** - Configurable stop-loss/take-profit
-- 🔔 **Telegram Alerts** - Instant notifications
+### Autopilot Mode
+- **Fully Autonomous Trading**: Set it and forget it
+- **Configurable Parameters**: Trade size, confidence threshold, max trades
+- **Automatic Stop Loss & Trailing Stop**
 
----
+### Risk Management
+- **Max Drawdown Protection**: Auto-pause if portfolio drops X%
+- **Daily Loss Limits**: Stop trading after hitting loss threshold
+- **Take Profit Tiers**: Partial sells at +5%, +10%, +20%
+- **DCA Autopilot**: Auto-buy dips
 
-## 🤖 Bot Commands
-
-| Command | Description |
-|---------|-------------|
-| `/start` | Welcome message |
-| `/signals` | Generate AI trading signals |
-| `/market` | Quick market overview |
-| `/balance` | Check account balances |
-| `/portfolio` | View open positions |
-| `/pnl` | Today's profit/loss |
-| `/settings` | View bot settings |
-| `/help` | Show help |
+### Analytics
+- **P&L Charts**: Visual performance tracking
+- **Win Streak Tracking**: Current and best streaks
+- **Daily Summaries**: Automatic 9 PM reports
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Create Accounts
+### Prerequisites
+- Python 3.11+
+- Telegram Bot Token
+- Coinbase CDP API Keys
+- Redis (optional)
+- Anthropic API Key
 
-- **Telegram Bot**: Message [@BotFather](https://t.me/BotFather) → `/newbot`
-- **Coinbase**: Sign up at [coinbase.com](https://coinbase.com)
-- **OpenAI**: Get API key at [platform.openai.com](https://platform.openai.com)
+### Environment Variables
 
-### 2. Get Coinbase API Keys
-
-1. Go to [Coinbase Advanced](https://www.coinbase.com/settings/api)
-2. Click **New API Key**
-3. Select permissions:
-   - ✅ View
-   - ✅ Trade
-4. Save the **API Key** and **Secret**
-
-### 3. Deploy to Railway
-
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template)
-
-### 4. Set Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `BOT_TOKEN` | Telegram bot token |
-| `BASE_URL` | Railway public URL |
-| `WEBHOOK_SECRET` | Any secret string |
-| `OPENAI_API_KEY` | OpenAI API key |
-| `COINBASE_API_KEY` | Coinbase API key |
-| `COINBASE_API_SECRET` | Coinbase API secret |
-| `TRADE_AMOUNT_USD` | Amount per trade (default: 10) |
-| `MAX_POSITIONS` | Max open positions (default: 3) |
-| `STOP_LOSS_PCT` | Stop loss % (default: 5) |
-| `TAKE_PROFIT_PCT` | Take profit % (default: 10) |
-
-### 5. Set Bot Commands
-
-Message @BotFather:
-```
-/setcommands
-
-start - Welcome message
-signals - AI trading signals
-market - Market overview
-balance - Account balances
-portfolio - Open positions
-pnl - Today's P&L
-settings - Bot settings
-help - Show help
+```env
+TELEGRAM_BOT_TOKEN=your_bot_token
+WEBHOOK_SECRET=random_secret_string
+BASE_URL=https://your-app.railway.app
+CDP_API_KEY_NAME=your_cdp_key_name
+CDP_API_KEY_PRIVATE=your_cdp_private_key
+ANTHROPIC_API_KEY=your_anthropic_key
+REDIS_URL=redis://...
+AUTO_SIGNAL_CHATS=123456789
+LIVE_TRADING=false
+TRADE_AMOUNT_USD=25
+STOP_LOSS_PCT=5
+TAKE_PROFIT_PCT=10
 ```
 
----
+### Deploy to Railway
 
-## 🏗️ Architecture
-
-```mermaid
-flowchart TB
-    subgraph TG["📱 Telegram"]
-        User["User Commands"]
-    end
-
-    subgraph Railway["🚂 Railway"]
-        Bot["FastAPI + Bot"]
-        AI["OpenAI GPT-4o"]
-        Bot --> AI
-    end
-
-    subgraph CB["💰 Coinbase"]
-        Data["Market Data"]
-        Trade["Trade Execution"]
-    end
-
-    User --> Bot
-    Bot --> Data
-    AI --> Trade
-    Trade --> User
-```
+1. Connect GitHub repo
+2. Add environment variables
+3. Deploy!
 
 ---
 
-## ⚠️ Risk Warning
+## 📱 Commands
 
-**Trading involves significant risk:**
-
-- Never trade more than you can afford to lose
-- Start with small amounts ($10-20 per trade)
-- AI signals are not guaranteed to be profitable
-- Past performance doesn't indicate future results
-- This bot is for educational purposes
-
----
-
-## 📊 Trading Pairs
-
-Default supported pairs:
-- BTC-USD (Bitcoin)
-- ETH-USD (Ethereum)
-- SOL-USD (Solana)
-- AVAX-USD (Avalanche)
-- LINK-USD (Chainlink)
+| Command | Description |
+|---------|-------------|
+| `/menu` | Interactive button menu |
+| `/buy BTC 50` | Buy $50 of BTC |
+| `/sell ETH` | Sell all ETH |
+| `/portfolio` | All holdings + P&L |
+| `/signals` | AI trading signals |
+| `/autopilot` | Autopilot control |
+| `/risk` | Risk dashboard |
+| `/performance` | Full report |
 
 ---
 
-## 🔒 Security
+## 🛡️ Risk Management
 
-- API keys stored as environment variables
-- Webhook protected by secret token
-- No keys in source code
-- Use API keys with **only trade permission** (no withdrawal)
-
----
-
-## 📝 License
-
-For educational purposes only. Not financial advice.
+- **Max Drawdown**: Auto-pause at X% loss
+- **Daily Loss Limit**: Stop after $X loss
+- **TP Tiers**: Sell 25% at +5%, +10%, +20%
+- **DCA Auto**: Buy dips automatically
 
 ---
 
-## 👤 Author
+## ⚠️ Disclaimer
 
-**Lesley Lloredia**
-- GitHub: [@lloredia](https://github.com/lloredia)
+Educational purposes only. Crypto trading involves risk. Only trade what you can afford to lose.
+
+---
+
+**Built by LESLEADS Consulting**
