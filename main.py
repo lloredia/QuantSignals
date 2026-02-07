@@ -502,6 +502,68 @@ async def market_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode="HTML")
 
 
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check account balances from Coinbase."""
+    
+    if not cdp_client:
+        await update.message.reply_text(
+            "❌ Coinbase not configured.\n\n"
+            "Add API keys to Railway variables."
+        )
+        return
+    
+    msg = await update.message.reply_text("💰 Fetching Coinbase balances...")
+    
+    try:
+        accounts = await cdp_client.get_accounts()
+        
+        if "error" in accounts:
+            await msg.edit_text(f"❌ Error: {accounts['error']}")
+            return
+        
+        text = """💰 <b>COINBASE BALANCES</b>
+━━━━━━━━━━━━━━━
+
+"""
+        
+        total_usd = 0
+        balances_found = []
+        
+        for account in accounts.get("accounts", []):
+            try:
+                balance = float(account.get("available_balance", {}).get("value", 0))
+                currency = account.get("currency", "")
+                
+                if balance > 0.0001:  # Skip dust
+                    if currency == "USD":
+                        balances_found.append(f"💵 <b>USD</b>: ${balance:,.2f}")
+                        total_usd += balance
+                    elif currency in ["BTC", "ETH", "SOL", "AVAX", "LINK", "USDC"]:
+                        # Only show main coins
+                        price = await get_public_price(f"{currency}-USD")
+                        if price > 0:
+                            usd_value = balance * price
+                            total_usd += usd_value
+                            balances_found.append(f"🪙 <b>{currency}</b>: {balance:.6f} (${usd_value:,.2f})")
+            except:
+                continue
+        
+        if balances_found:
+            text += "\n".join(balances_found)
+        else:
+            text += "No significant balances found"
+        
+        text += f"""
+
+━━━━━━━━━━━━━━━
+💰 <b>Total Value:</b> ${total_usd:,.2f}"""
+        
+        await msg.edit_text(text, parse_mode="HTML")
+        
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {str(e)[:100]}")
+
+
 async def portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current open positions."""
     
@@ -520,28 +582,43 @@ async def portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
     
     total_pnl = 0
-    for pair, pos in positions.items():
+    keyboard = []
+    
+    for pair, pos in list(positions.items()):
         current_price = await get_public_price(pair)
         entry = pos["entry_price"]
-        pnl_pct = ((current_price - entry) / entry) * 100
-        pnl_usd = (pnl_pct / 100) * pos["amount_usd"]
-        total_pnl += pnl_usd
         
-        emoji = "🟢" if pnl_pct > 0 else "🔴"
-        
-        text += f"""{emoji} <b>{pair}</b>
+        if current_price > 0 and entry > 0:
+            pnl_pct = ((current_price - entry) / entry) * 100
+            pnl_usd = (pnl_pct / 100) * pos["amount_usd"]
+            total_pnl += pnl_usd
+            
+            emoji = "🟢" if pnl_pct > 0 else "🔴"
+            is_live = "🔴 LIVE" if pos.get("live") else "🟡 PAPER"
+            
+            # Calculate stop/target
+            stop_price = entry * (1 - STOP_LOSS_PCT/100)
+            target_price = entry * (1 + TAKE_PROFIT_PCT/100)
+            
+            text += f"""{emoji} <b>{pair}</b> ({is_live})
 Entry: ${entry:,.2f}
 Current: ${current_price:,.2f}
 P&L: {pnl_pct:+.2f}% (${pnl_usd:+.2f})
+🛑 Stop: ${stop_price:,.2f} | 🎯 Target: ${target_price:,.2f}
 
 """
+            # Add close button for each position
+            keyboard.append([InlineKeyboardButton(f"❌ Close {pair.split('-')[0]}", callback_data=f"close_{pair}")])
+        else:
+            text += f"⚠️ <b>{pair}</b> - Error getting price\n\n"
     
     total_emoji = "🟢" if total_pnl >= 0 else "🔴"
     text += f"""━━━━━━━━━━━━━━━
-{total_emoji} <b>Total P&L:</b> ${total_pnl:+.2f}"""
+{total_emoji} <b>Total P&L:</b> ${total_pnl:+.2f}
+
+<i>Click button below to close a position</i>"""
     
-    keyboard = [[InlineKeyboardButton(f"Close {pair}", callback_data=f"close_{pair}")] for pair in positions]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
     
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
 
@@ -614,27 +691,36 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 result = await cdp_client.place_market_order(pair, "BUY", TRADE_AMOUNT_USD)
                 
-                if result.get("success") or result.get("order_id") or result.get("success_response"):
+                # Check for success - CDP returns success_response on success
+                if result.get("success_response") or result.get("order_id") or (result.get("success") == True):
+                    # Get fresh price after order
+                    entry_price = await get_public_price(pair)
+                    
                     positions[pair] = {
-                        "entry_price": price,
+                        "entry_price": entry_price,
                         "amount_usd": TRADE_AMOUNT_USD,
                         "timestamp": datetime.now().isoformat(),
-                        "live": True
+                        "live": True,
+                        "order_id": result.get("success_response", {}).get("order_id", "unknown")
                     }
                     
                     await query.edit_message_text(
                         f"✅ <b>LIVE ORDER EXECUTED</b>\n\n"
                         f"📊 {pair}\n"
                         f"💵 Amount: ${TRADE_AMOUNT_USD}\n"
-                        f"📍 Entry: ${price:,.2f}\n"
-                        f"🛑 Stop Loss: ${price * (1 - STOP_LOSS_PCT/100):,.2f}\n"
-                        f"🎯 Take Profit: ${price * (1 + TAKE_PROFIT_PCT/100):,.2f}\n\n"
-                        f"<i>Use /portfolio to track</i>",
+                        f"📍 Entry: ${entry_price:,.2f}\n"
+                        f"🛑 Stop Loss: ${entry_price * (1 - STOP_LOSS_PCT/100):,.2f}\n"
+                        f"🎯 Take Profit: ${entry_price * (1 + TAKE_PROFIT_PCT/100):,.2f}\n\n"
+                        f"✅ Position tracked! Use /portfolio to monitor.",
                         parse_mode="HTML"
                     )
+                elif result.get("error_response"):
+                    error = result.get("error_response", {})
+                    error_msg = error.get("message", "Unknown error")
+                    await query.edit_message_text(f"❌ Order failed: {error_msg}")
                 else:
-                    error = result.get("error") or result.get("message") or json.dumps(result)
-                    await query.edit_message_text(f"❌ Order failed: {error[:200]}")
+                    error = result.get("error") or result.get("message") or json.dumps(result)[:200]
+                    await query.edit_message_text(f"❌ Order failed: {error}")
                     
             except Exception as e:
                 await query.edit_message_text(f"❌ Error: {str(e)[:100]}")
@@ -703,6 +789,7 @@ tg_app.add_handler(CommandHandler("start", start))
 tg_app.add_handler(CommandHandler("help", help_cmd))
 tg_app.add_handler(CommandHandler("signals", signals_cmd))
 tg_app.add_handler(CommandHandler("market", market_cmd))
+tg_app.add_handler(CommandHandler("balance", balance_cmd))
 tg_app.add_handler(CommandHandler("portfolio", portfolio_cmd))
 tg_app.add_handler(CommandHandler("pnl", pnl_cmd))
 tg_app.add_handler(CommandHandler("settings", settings_cmd))
