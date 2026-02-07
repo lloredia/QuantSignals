@@ -542,10 +542,14 @@ AI-powered crypto trading with advanced features.
 /whale - Whale alerts
 /timeframe [coin] - Multi-TF analysis
 
+<b>🤖 Automation:</b>
+/autopilot - Full auto-trading mode
+/pause - Pause all trading
+/alert [coin] [price] - Price alerts
+
 <b>⚙️ Tools:</b>
 /backtest [coin] - Strategy backtest
 /leaderboard - Signal performance
-/alert [coin] [price] - Price alerts
 /dca - DCA opportunities
 /settings - Bot settings
 
