@@ -130,11 +130,31 @@ class CoinbaseCDPClient:
                     content=body_str,
                     timeout=15
                 )
-                result = resp.json()
-                print(f"[CDP] Order response: {result}")
-                return result
+                print(f"[CDP] Status: {resp.status_code}")
+                print(f"[CDP] Response: {resp.text[:500]}")
+                
+                if resp.status_code == 200 or resp.status_code == 201:
+                    return resp.json()
+                else:
+                    return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
         except Exception as e:
             print(f"[CDP ERROR] place_order: {e}")
+            return {"error": str(e)}
+    
+    async def test_auth(self) -> dict:
+        """Test API authentication."""
+        path = "/api/v3/brokerage/accounts"
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{self.BASE_URL}{path}",
+                    headers=self._headers("GET", path),
+                    timeout=15
+                )
+                print(f"[CDP TEST] Status: {resp.status_code}")
+                print(f"[CDP TEST] Response: {resp.text[:500]}")
+                return {"status": resp.status_code, "body": resp.text[:500]}
+        except Exception as e:
             return {"error": str(e)}
 
 
@@ -713,6 +733,16 @@ async def debug_price(pair: str):
     price = await get_public_price(pair)
     candles = await get_public_candles(pair)
     return {"pair": pair, "price": price, "candles_count": len(candles.get("prices", []))}
+
+
+@app.get("/debug/coinbase")
+async def debug_coinbase():
+    """Test Coinbase CDP authentication."""
+    if not cdp_client:
+        return {"error": "CDP client not initialized", "live_trading": LIVE_TRADING}
+    
+    result = await cdp_client.test_auth()
+    return {"live_trading": LIVE_TRADING, "auth_test": result}
 
 
 @app.post("/webhook/{secret}")
