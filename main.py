@@ -267,6 +267,51 @@ class CoinbaseCDPClient:
         except Exception as e:
             print(f"[CDP] Balance error: {e}")
         return 0.0
+    
+    async def get_all_holdings(self) -> dict:
+        """Get all crypto holdings from Coinbase with current values."""
+        holdings = {
+            "usd_balance": 0,
+            "crypto_value": 0,
+            "total_value": 0,
+            "assets": []
+        }
+        
+        try:
+            accounts = await self.get_accounts()
+            
+            for account in accounts.get("accounts", []):
+                currency = account.get("currency", "")
+                balance = float(account.get("available_balance", {}).get("value", 0))
+                
+                if balance <= 0.0000001:
+                    continue
+                
+                if currency == "USD":
+                    holdings["usd_balance"] = balance
+                    holdings["total_value"] += balance
+                else:
+                    # Get current price
+                    price = await get_public_price(f"{currency}-USD")
+                    if price > 0:
+                        value = balance * price
+                        holdings["crypto_value"] += value
+                        holdings["total_value"] += value
+                        
+                        holdings["assets"].append({
+                            "currency": currency,
+                            "balance": balance,
+                            "price": price,
+                            "value": value
+                        })
+            
+            # Sort by value descending
+            holdings["assets"] = sorted(holdings["assets"], key=lambda x: x["value"], reverse=True)
+            
+        except Exception as e:
+            print(f"[CDP] Holdings error: {e}")
+        
+        return holdings
 
 
 # Initialize CDP client
@@ -1496,37 +1541,127 @@ async def market_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show positions."""
-    if not positions:
-        await update.message.reply_text("📭 No open positions.\n\nUse /signals to get ideas.", parse_mode="HTML")
-        return
+    """Show complete portfolio with all Coinbase holdings."""
+    msg = await update.message.reply_text("📊 Loading portfolio...")
     
-    text = "📊 <b>PORTFOLIO</b>\n━━━━━━━━━━━━━━━\n\n"
-    total_pnl = 0
+    # Get all holdings from Coinbase
+    holdings = {"usd_balance": 0, "crypto_value": 0, "total_value": 0, "assets": []}
+    if cdp_client:
+        holdings = await cdp_client.get_all_holdings()
     
-    for pair, pos in positions.items():
-        current = await get_public_price(pair)
-        entry = pos["entry_price"]
-        pnl_pct = ((current - entry) / entry) * 100
-        pnl_usd = (pnl_pct / 100) * pos["amount_usd"]
-        total_pnl += pnl_usd
-        
-        emoji = "🟢" if pnl_pct > 0 else "🔴"
-        text += f"""{emoji} <b>{pair}</b>
-Entry: ${entry:,.2f} → ${current:,.2f}
-P&L: {pnl_pct:+.2f}% (${pnl_usd:+.2f})
+    total_value = holdings["total_value"]
+    usd_balance = holdings["usd_balance"]
+    crypto_value = holdings["crypto_value"]
+    
+    # Calculate allocation percentages
+    usd_pct = (usd_balance / total_value * 100) if total_value > 0 else 0
+    crypto_pct = (crypto_value / total_value * 100) if total_value > 0 else 0
+    
+    # Build beautiful UI
+    text = f"""
+╔═══════════════════════════════════════╗
+║      💼 <b>PORTFOLIO OVERVIEW</b>            ║
+╠═══════════════════════════════════════╣
+║                                       ║
+║  💰 <b>Total Value:</b>  <code>${total_value:,.2f}</code>        ║
+║                                       ║
+╠═══════════════════════════════════════╣
+║  <b>ALLOCATION</b>                          ║
+╠═══════════════════════════════════════╣
+║                                       ║
+║  💵 USD Cash:     <code>${usd_balance:,.2f}</code>  ({usd_pct:.1f}%)   ║
+║  🪙 Crypto:       <code>${crypto_value:,.2f}</code>  ({crypto_pct:.1f}%)   ║
+║                                       ║
+╠═══════════════════════════════════════╣
+║  <b>HOLDINGS</b>                            ║
+╚═══════════════════════════════════════╝
 """
-        # Feature 1: Trailing stop info
-        if "highest_price" in pos:
-            text += f"📈 Peak: ${pos['highest_price']:,.2f}\n"
-        text += "\n"
     
-    total_emoji = "🟢" if total_pnl >= 0 else "🔴"
-    text += f"━━━━━━━━━━━━━━━\n{total_emoji} <b>Total:</b> ${total_pnl:+.2f}"
+    if holdings["assets"]:
+        for asset in holdings["assets"][:10]:  # Top 10 holdings
+            currency = asset["currency"]
+            balance = asset["balance"]
+            price = asset["price"]
+            value = asset["value"]
+            pct = (value / total_value * 100) if total_value > 0 else 0
+            
+            # Create visual bar
+            bar_filled = int(pct / 5)  # Each █ = 5%
+            bar = "█" * bar_filled + "░" * (20 - bar_filled)
+            
+            # Check if we have an active position for P&L
+            pair = f"{currency}-USD"
+            pnl_str = ""
+            if pair in positions:
+                entry = positions[pair]["entry_price"]
+                pnl_pct = ((price - entry) / entry) * 100
+                emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                pnl_str = f" {emoji}{pnl_pct:+.1f}%"
+            
+            text += f"""
+┌─ <b>{currency}</b>{pnl_str}
+│  Balance: <code>{balance:.6f}</code>
+│  Price:   <code>${price:,.2f}</code>
+│  Value:   <code>${value:,.2f}</code> ({pct:.1f}%)
+│  [{bar}]
+└───────────────────────────
+"""
+    else:
+        text += "\n<i>No crypto holdings found</i>\n"
     
-    keyboard = [[InlineKeyboardButton(f"Close {pair}", callback_data=f"close_{pair}")] for pair in positions]
+    # Show bot-tracked positions with entry/P&L
+    if positions:
+        text += """
+╔═══════════════════════════════════════╗
+║  🤖 <b>ACTIVE TRADES</b>                    ║
+╠═══════════════════════════════════════╣
+"""
+        total_pnl = 0
+        for pair, pos in positions.items():
+            current = await get_public_price(pair)
+            entry = pos["entry_price"]
+            amount = pos.get("amount_usd", 0)
+            pnl_pct = ((current - entry) / entry) * 100
+            pnl_usd = (pnl_pct / 100) * amount
+            total_pnl += pnl_usd
+            
+            emoji = "🟢" if pnl_pct >= 0 else "🔴"
+            auto_tag = "🤖" if pos.get("autopilot") else "👤"
+            strategy = pos.get("strategy", "manual")[:12]
+            
+            peak = pos.get("highest_price", entry)
+            from_peak = ((current - peak) / peak) * 100 if peak > 0 else 0
+            
+            text += f"""║
+║ {emoji} <b>{pair}</b> {auto_tag}
+║   Entry: ${entry:,.2f} → Now: ${current:,.2f}
+║   P&L: <b>{pnl_pct:+.2f}%</b> (${pnl_usd:+.2f})
+║   Peak: ${peak:,.2f} ({from_peak:+.1f}%)
+║   Size: ${amount:.2f} | {strategy}
+"""
+        
+        total_emoji = "🟢" if total_pnl >= 0 else "🔴"
+        text += f"""╠═══════════════════════════════════════╣
+║ {total_emoji} <b>Unrealized P&L:</b> ${total_pnl:+.2f}           ║
+╚═══════════════════════════════════════╝
+"""
     
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    # Show daily stats
+    win_rate = (daily_pnl["wins"] / daily_pnl["trades"] * 100) if daily_pnl["trades"] > 0 else 0
+    text += f"""
+📅 <b>Today:</b> ${daily_pnl['realized']:+.2f} | {daily_pnl['trades']} trades | {win_rate:.0f}% wins
+"""
+    
+    # Add action buttons
+    keyboard = []
+    if positions:
+        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_portfolio")])
+        for pair in list(positions.keys())[:3]:  # Max 3 close buttons
+            keyboard.append([InlineKeyboardButton(f"❌ Close {pair}", callback_data=f"close_{pair}")])
+    
+    keyboard.append([InlineKeyboardButton("📊 Signals", callback_data="get_signals")])
+    
+    await msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
 
 
 async def pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1741,7 +1876,79 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     
-    if data.startswith("trade_buy_"):
+    if data == "refresh_portfolio":
+        # Refresh portfolio - call portfolio logic
+        await query.edit_message_text("📊 Refreshing portfolio...")
+        
+        holdings = {"usd_balance": 0, "crypto_value": 0, "total_value": 0, "assets": []}
+        if cdp_client:
+            holdings = await cdp_client.get_all_holdings()
+        
+        total_value = holdings["total_value"]
+        usd_balance = holdings["usd_balance"]
+        crypto_value = holdings["crypto_value"]
+        
+        usd_pct = (usd_balance / total_value * 100) if total_value > 0 else 0
+        crypto_pct = (crypto_value / total_value * 100) if total_value > 0 else 0
+        
+        text = f"""
+╔═══════════════════════════════════════╗
+║      💼 <b>PORTFOLIO OVERVIEW</b>            ║
+╠═══════════════════════════════════════╣
+║  💰 <b>Total:</b>  <code>${total_value:,.2f}</code>               ║
+╠═══════════════════════════════════════╣
+║  💵 USD:    <code>${usd_balance:,.2f}</code>  ({usd_pct:.1f}%)        ║
+║  🪙 Crypto: <code>${crypto_value:,.2f}</code>  ({crypto_pct:.1f}%)        ║
+╚═══════════════════════════════════════╝
+"""
+        
+        if holdings["assets"]:
+            for asset in holdings["assets"][:8]:
+                currency = asset["currency"]
+                value = asset["value"]
+                pct = (value / total_value * 100) if total_value > 0 else 0
+                bar_filled = int(pct / 5)
+                bar = "█" * bar_filled + "░" * (20 - bar_filled)
+                
+                pair = f"{currency}-USD"
+                pnl_str = ""
+                if pair in positions:
+                    entry = positions[pair]["entry_price"]
+                    pnl_pct = ((asset["price"] - entry) / entry) * 100
+                    emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                    pnl_str = f" {emoji}{pnl_pct:+.1f}%"
+                
+                text += f"\n<b>{currency}</b>{pnl_str}: ${value:,.2f} ({pct:.1f}%)\n[{bar}]\n"
+        
+        text += f"\n🕐 Updated: {datetime.now().strftime('%H:%M:%S')}"
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_portfolio")],
+            [InlineKeyboardButton("📊 Signals", callback_data="get_signals")]
+        ]
+        
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "get_signals":
+        await query.edit_message_text("🔄 Generating signals...")
+        
+        signals = await generate_trading_signals(include_news=False)
+        
+        text = "📊 <b>QUICK SIGNALS</b>\n━━━━━━━━━━━━━━━\n\n"
+        
+        if signals.get("signals"):
+            for sig in signals["signals"][:3]:
+                direction = sig.get("direction", sig.get("action", "HOLD"))
+                emoji = "🟢" if direction == "BUY" else "🔴"
+                text += f"{emoji} <b>{sig.get('pair')}</b>: {direction} ({sig.get('confidence')}%)\n"
+                text += f"   Entry: ${sig.get('entry_price', 0):,.2f}\n\n"
+        else:
+            text += "⚪ No signals right now\n"
+        
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="get_signals")]]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data.startswith("trade_buy_"):
         pair = data.replace("trade_buy_", "")
         price = await get_public_price(pair)
         
@@ -1798,6 +2005,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             daily_pnl["trades"] += 1
             if pnl_usd > 0:
                 daily_pnl["wins"] += 1
+            
+            # Track strategy performance
+            strategy = positions[pair].get("strategy", "manual")
+            if strategy in strategy_performance:
+                strategy_performance[strategy]["trades"] += 1
+                strategy_performance[strategy]["pnl"] += pnl_usd
+                if pnl_usd > 0:
+                    strategy_performance[strategy]["wins"] += 1
+                update_strategy_weights()
             
             del positions[pair]
             save_positions()
