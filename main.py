@@ -1,50 +1,108 @@
 import os
 import json
 import asyncio
+import logging
+import traceback
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
+from functools import wraps
 import pytz
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.error import TelegramError, NetworkError, TimedOut
 from openai import OpenAI
 import time
 import secrets
 
-# Optional Redis for persistence
+# ============ LOGGING SETUP ============
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("QuantSignals")
+
+# Reduce noise from libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+
+# ============ ERROR TRACKING ============
+error_counts = {
+    "api_errors": 0,
+    "telegram_errors": 0,
+    "coinbase_errors": 0,
+    "redis_errors": 0,
+    "last_error": None,
+    "last_error_time": None
+}
+
+
+def log_error(category: str, error: Exception, context: str = ""):
+    """Log error with tracking."""
+    error_counts[f"{category}_errors"] = error_counts.get(f"{category}_errors", 0) + 1
+    error_counts["last_error"] = f"{category}: {str(error)[:100]}"
+    error_counts["last_error_time"] = datetime.now().isoformat()
+    logger.error(f"[{category.upper()}] {context} - {error}")
+    logger.debug(traceback.format_exc())
+
+
+def safe_async(category: str = "general"):
+    """Decorator for safe async execution with error handling."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await func(*args, **kwargs)
+            except Exception as e:
+                log_error(category, e, func.__name__)
+                return None
+        return wrapper
+    return decorator
+
+
+# ============ REDIS CONNECTION ============
+redis_client = None
 try:
     import redis
     REDIS_URL = os.getenv("REDIS_URL")
     if REDIS_URL:
-        redis_client = redis.from_url(REDIS_URL)
-        print("✅ Redis connected")
+        redis_client = redis.from_url(REDIS_URL, socket_timeout=5, socket_connect_timeout=5)
+        redis_client.ping()  # Test connection
+        logger.info("✅ Redis connected")
     else:
-        redis_client = None
-except:
+        logger.warning("⚠️ REDIS_URL not set - using memory storage")
+except Exception as e:
+    logger.error(f"❌ Redis connection failed: {e}")
     redis_client = None
 
 
 # ============ STORAGE FUNCTIONS ============
-def save_data(key: str, data: dict):
-    """Save data to Redis."""
+def save_data(key: str, data: dict) -> bool:
+    """Save data to Redis with error handling."""
     if redis_client:
         try:
-            redis_client.set(f"qs_{key}", json.dumps(data))
+            redis_client.set(f"qs_{key}", json.dumps(data, default=str))
+            return True
         except Exception as e:
-            print(f"[REDIS] Save error: {e}")
+            log_error("redis", e, f"save_data({key})")
+    return False
 
 
 def load_data(key: str, default: dict = None) -> dict:
-    """Load data from Redis."""
+    """Load data from Redis with error handling."""
     if redis_client:
         try:
             data = redis_client.get(f"qs_{key}")
             if data:
                 return json.loads(data)
         except Exception as e:
-            print(f"[REDIS] Load error: {e}")
-    return default or {}
+            log_error("redis", e, f"load_data({key})")
+    return default if default is not None else {}
 
 
 def save_positions():
@@ -4347,66 +4405,239 @@ async def tp_tiers_monitor():
                         break  # Only hit one tier per cycle
                 
         except Exception as e:
-            print(f"[TP TIERS ERROR] {e}")
+            log_error("tp_tiers", e, "tp_tiers_monitor")
 
 
-# ============ FASTAPI ============
+# ============ FASTAPI SETUP ============
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Track uptime
+START_TIME = None
+
+
 @app.on_event("startup")
 async def on_startup():
+    global START_TIME
+    START_TIME = datetime.now()
+    
+    logger.info("🚀 Starting QuantSignals Ultra...")
+    
+    # Load state
     load_positions()
+    logger.info(f"📦 Loaded {len(positions)} positions, {len(trade_history)} trades")
+    
+    # Initialize Telegram
     await tg_app.initialize()
     await tg_app.start()
+    
     if BASE_URL:
         await tg_app.bot.set_webhook(url=f"{BASE_URL}/webhook/{WEBHOOK_SECRET}")
-        print(f"✅ Webhook set")
+        logger.info(f"✅ Webhook set: {BASE_URL}/webhook/***")
     
-    # Start all background tasks
-    asyncio.create_task(stop_loss_monitor())
-    asyncio.create_task(auto_signal_scheduler())
-    asyncio.create_task(price_alert_checker())
-    asyncio.create_task(autopilot_scanner())
-    asyncio.create_task(daily_summary_scheduler())
-    asyncio.create_task(dca_autopilot_scanner())
-    asyncio.create_task(risk_monitor())
-    asyncio.create_task(tp_tiers_monitor())
+    # Start all background tasks with error handling
+    tasks = [
+        ("stop_loss_monitor", stop_loss_monitor()),
+        ("auto_signal_scheduler", auto_signal_scheduler()),
+        ("price_alert_checker", price_alert_checker()),
+        ("autopilot_scanner", autopilot_scanner()),
+        ("daily_summary_scheduler", daily_summary_scheduler()),
+        ("dca_autopilot_scanner", dca_autopilot_scanner()),
+        ("risk_monitor", risk_monitor()),
+        ("tp_tiers_monitor", tp_tiers_monitor()),
+    ]
     
-    print("✅ All background tasks started")
+    for name, coro in tasks:
+        asyncio.create_task(coro, name=name)
+        logger.info(f"  ✓ {name} started")
+    
+    logger.info("✅ QuantSignals Ultra ready!")
+    logger.info(f"  Mode: {'🔴 LIVE' if LIVE_TRADING else '🟡 PAPER'}")
+    logger.info(f"  Autopilot: {'🟢 ON' if autopilot_settings.get('enabled') else '🔴 OFF'}")
+    logger.info(f"  Coinbase: {'✅ Connected' if cdp_client else '❌ Not configured'}")
+    logger.info(f"  Redis: {'✅ Connected' if redis_client else '⚠️ Memory only'}")
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    logger.info("🛑 Shutting down QuantSignals...")
     save_positions()
+    logger.info("💾 State saved")
     await tg_app.stop()
+    logger.info("👋 Goodbye!")
 
 
+# ============ HEALTH & MONITORING ENDPOINTS ============
 @app.get("/")
-async def health():
-    return {"status": "ok", "bot": "QuantSignals v2", "positions": len(positions)}
+async def root():
+    """Basic health check."""
+    return {
+        "status": "ok",
+        "bot": "QuantSignals Ultra",
+        "version": "2.0.0"
+    }
 
 
-@app.get("/debug/signals")
-async def debug_signals():
-    return await generate_trading_signals()
-
-
-@app.get("/test/auto-signal")
-async def test_auto_signal():
-    if not AUTO_SIGNAL_CHATS:
-        return {"error": "No AUTO_SIGNAL_CHATS"}
+@app.get("/health")
+async def health_check():
+    """Comprehensive health check for monitoring."""
+    uptime = (datetime.now() - START_TIME).total_seconds() if START_TIME else 0
     
-    signals = await generate_trading_signals()
-    text = "🧪 <b>TEST</b>\n" + json.dumps(signals.get("signals", []), indent=2)[:500]
+    # Check Redis
+    redis_ok = False
+    if redis_client:
+        try:
+            redis_client.ping()
+            redis_ok = True
+        except:
+            pass
     
-    for chat_id in AUTO_SIGNAL_CHATS:
-        await tg_app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    # Check Coinbase
+    coinbase_ok = cdp_client is not None
     
-    return {"sent": len(AUTO_SIGNAL_CHATS)}
+    return {
+        "status": "healthy",
+        "uptime_seconds": int(uptime),
+        "uptime_human": str(timedelta(seconds=int(uptime))),
+        "components": {
+            "redis": "ok" if redis_ok else "unavailable",
+            "coinbase": "ok" if coinbase_ok else "not_configured",
+            "telegram": "ok"
+        },
+        "trading": {
+            "mode": "live" if LIVE_TRADING else "paper",
+            "autopilot": autopilot_settings.get("enabled", False),
+            "positions": len(positions),
+            "trades_today": autopilot_settings.get("trades_today", 0)
+        },
+        "errors": {
+            "total": sum(v for k, v in error_counts.items() if k.endswith("_errors")),
+            "last": error_counts.get("last_error"),
+            "last_time": error_counts.get("last_error_time")
+        }
+    }
+
+
+@app.get("/stats")
+async def get_stats():
+    """Get trading statistics."""
+    total_pnl = sum(t.get("pnl_usd", 0) for t in trade_history)
+    wins = sum(1 for t in trade_history if t.get("pnl_usd", 0) > 0)
+    total = len(trade_history)
+    
+    return {
+        "portfolio": {
+            "positions": len(positions),
+            "pairs": list(positions.keys())
+        },
+        "performance": {
+            "total_trades": total,
+            "wins": wins,
+            "losses": total - wins,
+            "win_rate": round(wins / total * 100, 1) if total > 0 else 0,
+            "total_pnl": round(total_pnl, 2)
+        },
+        "today": {
+            "pnl": round(daily_pnl.get("realized", 0), 2),
+            "trades": daily_pnl.get("trades", 0),
+            "wins": daily_pnl.get("wins", 0)
+        },
+        "autopilot": {
+            "enabled": autopilot_settings.get("enabled", False),
+            "trades_today": autopilot_settings.get("trades_today", 0),
+            "total_profit": round(autopilot_settings.get("total_profit", 0), 2)
+        },
+        "risk": {
+            "drawdown": round(risk_state.get("current_drawdown", 0), 1),
+            "max_drawdown": risk_state.get("max_drawdown_pct", 10),
+            "paused": risk_state.get("paused_reason")
+        }
+    }
+
+
+@app.get("/positions")
+async def get_positions():
+    """Get current positions with live P&L."""
+    result = []
+    for pair, pos in positions.items():
+        try:
+            current = await get_public_price(pair)
+            entry = pos["entry_price"]
+            pnl_pct = ((current - entry) / entry) * 100
+            pnl_usd = (pnl_pct / 100) * pos.get("amount_usd", 0)
+            
+            result.append({
+                "pair": pair,
+                "entry_price": entry,
+                "current_price": current,
+                "amount_usd": pos.get("amount_usd", 0),
+                "pnl_pct": round(pnl_pct, 2),
+                "pnl_usd": round(pnl_usd, 2),
+                "opened_at": pos.get("timestamp"),
+                "strategy": pos.get("strategy", "manual"),
+                "autopilot": pos.get("autopilot", False)
+            })
+        except Exception as e:
+            log_error("api", e, f"get_positions({pair})")
+    
+    return {"positions": result, "count": len(result)}
+
+
+@app.get("/signals")
+async def get_signals_api():
+    """Get current AI signals."""
+    try:
+        signals = await generate_trading_signals()
+        return signals
+    except Exception as e:
+        log_error("api", e, "get_signals_api")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/webhook/{secret}")
 async def webhook(secret: str, request: Request):
+    """Telegram webhook handler."""
     if secret != WEBHOOK_SECRET:
-        return {"ok": False}
-    update = Update.de_json(await request.json(), tg_app.bot)
-    await tg_app.process_update(update)
-    return {"ok": True}
+        logger.warning(f"Invalid webhook secret attempted")
+        raise HTTPException(status_code=403, detail="Invalid secret")
+    
+    try:
+        data = await request.json()
+        update = Update.de_json(data, tg_app.bot)
+        await tg_app.process_update(update)
+        return {"ok": True}
+    except Exception as e:
+        log_error("telegram", e, "webhook")
+        return {"ok": False, "error": str(e)}
+
+
+# ============ ADMIN ENDPOINTS ============
+@app.post("/admin/pause")
+async def admin_pause():
+    """Pause autopilot (for emergencies)."""
+    autopilot_settings["enabled"] = False
+    risk_state["paused_reason"] = "Admin pause"
+    save_positions()
+    logger.warning("⚠️ Autopilot paused by admin")
+    return {"status": "paused"}
+
+
+@app.post("/admin/resume")
+async def admin_resume():
+    """Resume autopilot."""
+    autopilot_settings["enabled"] = True
+    risk_state["paused_reason"] = None
+    save_positions()
+    logger.info("✅ Autopilot resumed by admin")
+    return {"status": "resumed"}
+
+
+@app.get("/admin/errors")
+async def admin_errors():
+    """Get error log."""
+    return error_counts
