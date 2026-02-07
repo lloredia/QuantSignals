@@ -52,15 +52,19 @@ def save_positions():
     save_data("daily_pnl", daily_pnl)
     save_data("signal_history", signal_history)
     save_data("price_alerts", price_alerts)
+    save_data("trade_history", trade_history)
+    save_data("strategy_performance", strategy_performance)
 
 
 def load_positions():
-    global positions, daily_pnl, signal_history, price_alerts
+    global positions, daily_pnl, signal_history, price_alerts, trade_history, strategy_performance
     positions = load_data("positions", {})
     daily_pnl = load_data("daily_pnl", {"realized": 0.0, "trades": 0, "wins": 0})
     signal_history = load_data("signal_history", [])
     price_alerts = load_data("price_alerts", {})
-    print(f"[REDIS] Loaded {len(positions)} positions, {len(signal_history)} signals")
+    trade_history = load_data("trade_history", [])
+    strategy_performance = load_data("strategy_performance", strategy_performance)
+    print(f"[REDIS] Loaded {len(positions)} positions, {len(trade_history)} trades")
 
 
 # ============ CONFIG ============
@@ -126,6 +130,7 @@ positions = {}
 daily_pnl = {"realized": 0.0, "trades": 0, "wins": 0}
 signal_history = []  # Feature 7: Leaderboard
 price_alerts = {}  # Feature 8: Custom Alerts
+trade_history = []  # Trade history for reports
 
 # Live trading mode
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
@@ -971,17 +976,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ═══════════════════════════════════
 
-<b>📈 Trading:</b>
+<b>💰 Trading:</b>
+/buy [coin] [amount] - Quick buy
+/sell [coin] [%] - Quick sell
+/limit [coin] [price] - Limit alert
 /signals - AI quantitative signals
-/market - Live prices + RSI
-/portfolio - Your positions
-/pnl - Daily P&L
 
-<b>📊 Analysis:</b>
+<b>📊 Portfolio:</b>
+/portfolio - All holdings + P&L
+/pnl - Today's P&L
+/history - Trade history
+/performance - Weekly/monthly report
+
+<b>📈 Analysis:</b>
 /regime - Market regime detection
 /fear - Fear & Greed Index
 /news - Crypto news
-/timeframe [coin] - Multi-TF analysis
+/timeframe [coin] - Multi-TF
 /whale - Whale alerts
 
 <b>🤖 Ultra Mode:</b>
@@ -991,9 +1002,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /pause - Pause trading
 
 <b>⚙️ Tools:</b>
+/market - Live prices
+/alerts - View all alerts
 /backtest [coin] - Strategy backtest
 /leaderboard - Signal performance
-/alert [coin] [price] - Price alerts
 /dca - DCA opportunities
 /settings - Bot settings
 
@@ -1680,6 +1692,385 @@ async def pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+# ============ QUICK BUY COMMAND ============
+async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick buy: /buy BTC 50 or /buy BTC"""
+    args = context.args
+    
+    if not args:
+        await update.message.reply_text(
+            "💰 <b>QUICK BUY</b>\n\n"
+            "Usage:\n"
+            "<code>/buy BTC</code> - Buy with default amount\n"
+            "<code>/buy BTC 50</code> - Buy $50 of BTC\n"
+            "<code>/buy ETH 100</code> - Buy $100 of ETH\n\n"
+            f"Default amount: ${TRADE_AMOUNT_USD}",
+            parse_mode="HTML"
+        )
+        return
+    
+    coin = args[0].upper()
+    pair = f"{coin}-USD"
+    
+    # Validate pair
+    if pair not in TRADING_PAIRS:
+        coins = ", ".join([p.split("-")[0] for p in TRADING_PAIRS])
+        await update.message.reply_text(f"❌ Unknown coin. Available: {coins}")
+        return
+    
+    # Get amount
+    amount = float(args[1]) if len(args) > 1 else TRADE_AMOUNT_USD
+    
+    if amount < 1:
+        await update.message.reply_text("❌ Minimum buy is $1")
+        return
+    
+    # Check balance
+    usd_balance = 0
+    if cdp_client:
+        usd_balance = await cdp_client.get_usd_balance()
+    
+    if LIVE_TRADING and amount > usd_balance:
+        await update.message.reply_text(
+            f"❌ Insufficient balance\n\n"
+            f"Requested: ${amount:.2f}\n"
+            f"Available: ${usd_balance:.2f}"
+        )
+        return
+    
+    price = await get_public_price(pair)
+    
+    # Confirm
+    keyboard = [
+        [InlineKeyboardButton(f"✅ Confirm ${amount} Buy", callback_data=f"confirm_buy_{pair}_{amount}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_order")]
+    ]
+    
+    await update.message.reply_text(
+        f"💰 <b>CONFIRM BUY</b>\n\n"
+        f"📊 Pair: <b>{pair}</b>\n"
+        f"💵 Amount: <b>${amount:.2f}</b>\n"
+        f"💲 Price: ${price:,.2f}\n"
+        f"🪙 You get: ~{amount/price:.6f} {coin}\n\n"
+        f"Mode: {'🔴 LIVE' if LIVE_TRADING else '🟡 PAPER'}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# ============ QUICK SELL COMMAND ============
+async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick sell: /sell BTC or /sell BTC 50%"""
+    args = context.args
+    
+    if not args:
+        # Show sellable holdings
+        holdings = {"assets": []}
+        if cdp_client:
+            holdings = await cdp_client.get_all_holdings()
+        
+        if not holdings["assets"]:
+            await update.message.reply_text("📭 No crypto holdings to sell.")
+            return
+        
+        text = "💸 <b>QUICK SELL</b>\n━━━━━━━━━━━━━━━\n\n"
+        text += "Your holdings:\n\n"
+        
+        keyboard = []
+        for asset in holdings["assets"][:8]:
+            currency = asset["currency"]
+            value = asset["value"]
+            text += f"🪙 <b>{currency}</b>: ${value:,.2f}\n"
+            keyboard.append([InlineKeyboardButton(f"Sell {currency}", callback_data=f"sell_menu_{currency}")])
+        
+        text += "\nUsage:\n"
+        text += "<code>/sell BTC</code> - Sell all BTC\n"
+        text += "<code>/sell BTC 50</code> - Sell 50% of BTC\n"
+        
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    
+    coin = args[0].upper()
+    pair = f"{coin}-USD"
+    sell_pct = float(args[1]) if len(args) > 1 else 100
+    sell_pct = max(1, min(100, sell_pct))
+    
+    # Get holdings
+    holdings = {"assets": []}
+    if cdp_client:
+        holdings = await cdp_client.get_all_holdings()
+    
+    # Find the asset
+    asset = next((a for a in holdings["assets"] if a["currency"] == coin), None)
+    
+    if not asset:
+        await update.message.reply_text(f"❌ You don't hold any {coin}")
+        return
+    
+    sell_value = asset["value"] * (sell_pct / 100)
+    sell_amount = asset["balance"] * (sell_pct / 100)
+    
+    keyboard = [
+        [InlineKeyboardButton(f"✅ Sell {sell_pct}% (${sell_value:.2f})", callback_data=f"confirm_sell_{pair}_{sell_pct}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_order")]
+    ]
+    
+    # Check P&L if tracked position
+    pnl_str = ""
+    if pair in positions:
+        entry = positions[pair]["entry_price"]
+        pnl_pct = ((asset["price"] - entry) / entry) * 100
+        emoji = "🟢" if pnl_pct >= 0 else "🔴"
+        pnl_str = f"\n{emoji} P&L: {pnl_pct:+.2f}%"
+    
+    await update.message.reply_text(
+        f"💸 <b>CONFIRM SELL</b>\n\n"
+        f"📊 Pair: <b>{pair}</b>\n"
+        f"📉 Selling: <b>{sell_pct}%</b>\n"
+        f"🪙 Amount: {sell_amount:.6f} {coin}\n"
+        f"💵 Value: ~${sell_value:.2f}\n"
+        f"💲 Price: ${asset['price']:,.2f}"
+        f"{pnl_str}\n\n"
+        f"Mode: {'🔴 LIVE' if LIVE_TRADING else '🟡 PAPER'}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# ============ LIMIT ORDER COMMAND ============
+async def limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set limit order alert: /limit BTC 95000"""
+    args = context.args
+    
+    if len(args) < 2:
+        await update.message.reply_text(
+            "📋 <b>LIMIT ORDER ALERTS</b>\n\n"
+            "Set price alerts that auto-buy when hit:\n\n"
+            "<code>/limit BTC 95000</code> - Alert at $95k\n"
+            "<code>/limit ETH 3500 100</code> - Alert + buy $100\n\n"
+            "<i>Note: These are alerts, not real limit orders.\n"
+            "Bot will notify you when price hits target.</i>",
+            parse_mode="HTML"
+        )
+        return
+    
+    coin = args[0].upper()
+    pair = f"{coin}-USD"
+    target_price = float(args[1])
+    amount = float(args[2]) if len(args) > 2 else TRADE_AMOUNT_USD
+    
+    if pair not in TRADING_PAIRS:
+        await update.message.reply_text("❌ Unknown coin")
+        return
+    
+    current = await get_public_price(pair)
+    direction = "below" if target_price < current else "above"
+    pct_away = ((target_price - current) / current) * 100
+    
+    # Store limit alert
+    limit_key = f"limit_{pair}_{target_price}"
+    price_alerts[limit_key] = {
+        "pair": pair,
+        "target": target_price,
+        "amount": amount,
+        "direction": direction,
+        "created": datetime.now().isoformat(),
+        "type": "limit"
+    }
+    save_positions()
+    
+    await update.message.reply_text(
+        f"📋 <b>LIMIT ALERT SET</b>\n\n"
+        f"📊 Pair: <b>{pair}</b>\n"
+        f"🎯 Target: ${target_price:,.2f} ({direction})\n"
+        f"💵 Amount: ${amount:.2f}\n"
+        f"💲 Current: ${current:,.2f} ({pct_away:+.1f}%)\n\n"
+        f"✅ You'll be notified when price hits target.\n\n"
+        f"<i>Use /alerts to view all alerts</i>",
+        parse_mode="HTML"
+    )
+
+
+# ============ TRADE HISTORY COMMAND ============
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show trade history."""
+    
+    if not trade_history:
+        await update.message.reply_text(
+            "📜 <b>TRADE HISTORY</b>\n\n"
+            "No trades recorded yet.\n\n"
+            "<i>Trades are tracked when positions are closed.</i>",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Get recent trades
+    recent = trade_history[-20:][::-1]  # Last 20, newest first
+    
+    text = "📜 <b>TRADE HISTORY</b>\n━━━━━━━━━━━━━━━\n\n"
+    
+    total_pnl = 0
+    wins = 0
+    
+    for trade in recent:
+        pnl = trade.get("pnl_usd", 0)
+        total_pnl += pnl
+        if pnl > 0:
+            wins += 1
+        
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        date = trade.get("closed_at", trade.get("timestamp", ""))[:10]
+        
+        text += f"{emoji} <b>{trade.get('pair', 'N/A')}</b> | {date}\n"
+        text += f"   ${trade.get('entry', 0):,.2f} → ${trade.get('exit', 0):,.2f}\n"
+        text += f"   P&L: ${pnl:+.2f} ({trade.get('pnl_pct', 0):+.1f}%)\n\n"
+    
+    win_rate = (wins / len(recent) * 100) if recent else 0
+    
+    text += f"━━━━━━━━━━━━━━━\n"
+    text += f"📊 Last {len(recent)} trades\n"
+    text += f"{'🟢' if total_pnl >= 0 else '🔴'} Total P&L: ${total_pnl:+.2f}\n"
+    text += f"🎯 Win Rate: {win_rate:.1f}%\n\n"
+    
+    keyboard = [[InlineKeyboardButton("📤 Export CSV", callback_data="export_history")]]
+    
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ============ PERFORMANCE REPORT COMMAND ============
+async def performance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Weekly/monthly performance report."""
+    
+    # Calculate stats
+    total_trades = len(trade_history)
+    
+    if total_trades == 0:
+        await update.message.reply_text(
+            "📈 <b>PERFORMANCE REPORT</b>\n\n"
+            "No trading data yet.\n\n"
+            "<i>Start trading to see performance stats.</i>",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Calculate metrics
+    total_pnl = sum(t.get("pnl_usd", 0) for t in trade_history)
+    wins = sum(1 for t in trade_history if t.get("pnl_usd", 0) > 0)
+    losses = total_trades - wins
+    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+    
+    winning_trades = [t.get("pnl_usd", 0) for t in trade_history if t.get("pnl_usd", 0) > 0]
+    losing_trades = [t.get("pnl_usd", 0) for t in trade_history if t.get("pnl_usd", 0) < 0]
+    
+    avg_win = sum(winning_trades) / len(winning_trades) if winning_trades else 0
+    avg_loss = sum(losing_trades) / len(losing_trades) if losing_trades else 0
+    
+    profit_factor = abs(sum(winning_trades) / sum(losing_trades)) if losing_trades and sum(losing_trades) != 0 else 0
+    
+    # Get balance
+    usd_balance = 0
+    total_value = 0
+    if cdp_client:
+        holdings = await cdp_client.get_all_holdings()
+        usd_balance = holdings.get("usd_balance", 0)
+        total_value = holdings.get("total_value", 0)
+    
+    # This week's stats
+    week_ago = datetime.now() - timedelta(days=7)
+    week_trades = [t for t in trade_history if t.get("closed_at", "") > week_ago.isoformat()]
+    week_pnl = sum(t.get("pnl_usd", 0) for t in week_trades)
+    
+    # This month's stats
+    month_ago = datetime.now() - timedelta(days=30)
+    month_trades = [t for t in trade_history if t.get("closed_at", "") > month_ago.isoformat()]
+    month_pnl = sum(t.get("pnl_usd", 0) for t in month_trades)
+    
+    text = f"""
+╔═══════════════════════════════════════╗
+║      📈 <b>PERFORMANCE REPORT</b>           ║
+╠═══════════════════════════════════════╣
+║                                       ║
+║  💰 Portfolio: <code>${total_value:,.2f}</code>           ║
+║  💵 Cash: <code>${usd_balance:,.2f}</code>                ║
+║                                       ║
+╠═══════════════════════════════════════╣
+║  <b>ALL TIME</b>                           ║
+╠═══════════════════════════════════════╣
+║                                       ║
+║  📊 Total Trades: {total_trades}                   ║
+║  ✅ Wins: {wins} | ❌ Losses: {losses}             ║
+║  🎯 Win Rate: {win_rate:.1f}%                     ║
+║  {'🟢' if total_pnl >= 0 else '🔴'} Total P&L: <b>${total_pnl:+,.2f}</b>            ║
+║                                       ║
+║  📈 Avg Win: ${avg_win:+.2f}                  ║
+║  📉 Avg Loss: ${avg_loss:.2f}                 ║
+║  ⚖️ Profit Factor: {profit_factor:.2f}               ║
+║                                       ║
+╠═══════════════════════════════════════╣
+║  <b>THIS WEEK</b> ({len(week_trades)} trades)             ║
+╠═══════════════════════════════════════╣
+║  {'🟢' if week_pnl >= 0 else '🔴'} P&L: <b>${week_pnl:+,.2f}</b>                    ║
+║                                       ║
+╠═══════════════════════════════════════╣
+║  <b>THIS MONTH</b> ({len(month_trades)} trades)           ║
+╠═══════════════════════════════════════╣
+║  {'🟢' if month_pnl >= 0 else '🔴'} P&L: <b>${month_pnl:+,.2f}</b>                   ║
+║                                       ║
+╠═══════════════════════════════════════╣
+║  <b>STRATEGY BREAKDOWN</b>                 ║
+╚═══════════════════════════════════════╝
+"""
+    
+    # Add strategy performance
+    for strat, stats in sorted(strategy_performance.items(), key=lambda x: x[1]["pnl"], reverse=True):
+        if stats["trades"] > 0:
+            strat_wr = (stats["wins"] / stats["trades"] * 100) if stats["trades"] > 0 else 0
+            emoji = "🟢" if stats["pnl"] >= 0 else "🔴"
+            text += f"\n{emoji} <b>{strat.replace('_', ' ').title()}</b>\n"
+            text += f"   {stats['trades']} trades | {strat_wr:.0f}% WR | ${stats['pnl']:+.2f}\n"
+    
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+# ============ ALERTS COMMAND (Enhanced) ============
+async def alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all active alerts including limit orders."""
+    
+    if not price_alerts:
+        await update.message.reply_text(
+            "🔔 <b>ALERTS</b>\n\n"
+            "No active alerts.\n\n"
+            "Set alerts:\n"
+            "<code>/alert BTC 100000</code> - Price alert\n"
+            "<code>/limit BTC 95000</code> - Limit order alert",
+            parse_mode="HTML"
+        )
+        return
+    
+    text = "🔔 <b>ACTIVE ALERTS</b>\n━━━━━━━━━━━━━━━\n\n"
+    
+    for key, alert in price_alerts.items():
+        alert_type = alert.get("type", "price")
+        pair = alert.get("pair", "")
+        target = alert.get("target", alert.get("price", 0))
+        
+        current = await get_public_price(pair)
+        pct_away = ((target - current) / current) * 100 if current else 0
+        
+        if alert_type == "limit":
+            text += f"📋 <b>{pair}</b> LIMIT\n"
+            text += f"   Target: ${target:,.2f} ({pct_away:+.1f}%)\n"
+            text += f"   Amount: ${alert.get('amount', 0):.2f}\n\n"
+        else:
+            direction = alert.get("direction", "above" if target > current else "below")
+            text += f"🔔 <b>{pair}</b>\n"
+            text += f"   Alert {direction} ${target:,.2f} ({pct_away:+.1f}%)\n\n"
+    
+    keyboard = [[InlineKeyboardButton("🗑️ Clear All Alerts", callback_data="clear_all_alerts")]]
+    
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Settings."""
     text = f"""⚙️ <b>SETTINGS</b>
@@ -2015,6 +2406,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     strategy_performance[strategy]["wins"] += 1
                 update_strategy_weights()
             
+            # Add to trade history
+            trade_history.append({
+                "pair": pair,
+                "entry": entry,
+                "exit": current,
+                "pnl_pct": round(pnl_pct, 2),
+                "pnl_usd": round(pnl_usd, 2),
+                "amount_usd": positions[pair].get("amount_usd", 0),
+                "strategy": strategy,
+                "opened_at": positions[pair].get("timestamp"),
+                "closed_at": datetime.now().isoformat(),
+                "live": positions[pair].get("live", False)
+            })
+            
             del positions[pair]
             save_positions()
             
@@ -2025,6 +2430,184 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{emoji} P&L: {pnl_pct:+.2f}% (${pnl_usd:+.2f})",
                 parse_mode="HTML"
             )
+    
+    # New handlers for buy/sell/limit
+    elif data.startswith("confirm_buy_"):
+        parts = data.replace("confirm_buy_", "").split("_")
+        pair = parts[0] + "-" + parts[1]  # BTC-USD
+        amount = float(parts[2]) if len(parts) > 2 else TRADE_AMOUNT_USD
+        
+        price = await get_public_price(pair)
+        
+        if LIVE_TRADING and cdp_client:
+            await query.edit_message_text(f"🔄 Executing BUY {pair}...")
+            result = await cdp_client.place_market_order(pair, "BUY", amount)
+            
+            if result.get("success_response") or result.get("order_id"):
+                positions[pair] = {
+                    "entry_price": price,
+                    "highest_price": price,
+                    "amount_usd": amount,
+                    "timestamp": datetime.now().isoformat(),
+                    "live": True,
+                    "strategy": "manual"
+                }
+                save_positions()
+                
+                await query.edit_message_text(
+                    f"✅ <b>BUY EXECUTED</b>\n\n"
+                    f"📊 {pair}\n"
+                    f"💵 ${amount:.2f} @ ${price:,.2f}\n"
+                    f"🪙 Got ~{amount/price:.6f} {pair.split('-')[0]}\n\n"
+                    f"🛑 SL: ${price*(1-STOP_LOSS_PCT/100):,.2f}\n"
+                    f"🎯 TP: ${price*(1+TAKE_PROFIT_PCT/100):,.2f}",
+                    parse_mode="HTML"
+                )
+            else:
+                error = result.get("error", "Unknown error")
+                await query.edit_message_text(f"❌ Buy failed: {error}")
+        else:
+            positions[pair] = {
+                "entry_price": price,
+                "highest_price": price,
+                "amount_usd": amount,
+                "timestamp": datetime.now().isoformat(),
+                "live": False,
+                "strategy": "manual"
+            }
+            save_positions()
+            await query.edit_message_text(
+                f"✅ <b>PAPER BUY</b>\n\n"
+                f"📊 {pair} @ ${price:,.2f}\n"
+                f"💵 Amount: ${amount:.2f}",
+                parse_mode="HTML"
+            )
+    
+    elif data.startswith("confirm_sell_"):
+        parts = data.replace("confirm_sell_", "").split("_")
+        pair = parts[0] + "-" + parts[1]
+        sell_pct = float(parts[2]) if len(parts) > 2 else 100
+        
+        if not cdp_client:
+            await query.edit_message_text("❌ Coinbase not connected")
+            return
+        
+        # Get holdings to find amount
+        holdings = await cdp_client.get_all_holdings()
+        coin = pair.split("-")[0]
+        asset = next((a for a in holdings["assets"] if a["currency"] == coin), None)
+        
+        if not asset:
+            await query.edit_message_text(f"❌ No {coin} to sell")
+            return
+        
+        sell_value = asset["value"] * (sell_pct / 100)
+        
+        if LIVE_TRADING:
+            await query.edit_message_text(f"🔄 Executing SELL {pair}...")
+            result = await cdp_client.place_market_order(pair, "SELL", sell_value)
+            
+            if result.get("success_response") or result.get("order_id"):
+                # Track P&L if we had a position
+                pnl_str = ""
+                if pair in positions:
+                    entry = positions[pair]["entry_price"]
+                    pnl_pct = ((asset["price"] - entry) / entry) * 100
+                    pnl_usd = sell_value * (pnl_pct / 100)
+                    
+                    trade_history.append({
+                        "pair": pair,
+                        "entry": entry,
+                        "exit": asset["price"],
+                        "pnl_pct": round(pnl_pct, 2),
+                        "pnl_usd": round(pnl_usd, 2),
+                        "closed_at": datetime.now().isoformat(),
+                        "live": True
+                    })
+                    
+                    daily_pnl["realized"] += pnl_usd
+                    daily_pnl["trades"] += 1
+                    if pnl_usd > 0:
+                        daily_pnl["wins"] += 1
+                    
+                    if sell_pct >= 100:
+                        del positions[pair]
+                    
+                    emoji = "🟢" if pnl_usd >= 0 else "🔴"
+                    pnl_str = f"\n{emoji} P&L: {pnl_pct:+.2f}% (${pnl_usd:+.2f})"
+                
+                save_positions()
+                
+                await query.edit_message_text(
+                    f"✅ <b>SELL EXECUTED</b>\n\n"
+                    f"📊 {pair}\n"
+                    f"💵 Sold {sell_pct}% (~${sell_value:.2f})"
+                    f"{pnl_str}",
+                    parse_mode="HTML"
+                )
+            else:
+                await query.edit_message_text(f"❌ Sell failed")
+        else:
+            await query.edit_message_text("⚠️ Enable LIVE_TRADING for real sells")
+    
+    elif data.startswith("sell_menu_"):
+        coin = data.replace("sell_menu_", "")
+        pair = f"{coin}-USD"
+        
+        holdings = await cdp_client.get_all_holdings()
+        asset = next((a for a in holdings["assets"] if a["currency"] == coin), None)
+        
+        if not asset:
+            await query.edit_message_text(f"❌ No {coin} found")
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton("Sell 25%", callback_data=f"confirm_sell_{pair}_25")],
+            [InlineKeyboardButton("Sell 50%", callback_data=f"confirm_sell_{pair}_50")],
+            [InlineKeyboardButton("Sell 100%", callback_data=f"confirm_sell_{pair}_100")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_order")]
+        ]
+        
+        await query.edit_message_text(
+            f"💸 <b>SELL {coin}</b>\n\n"
+            f"Balance: {asset['balance']:.6f} {coin}\n"
+            f"Value: ${asset['value']:,.2f}\n"
+            f"Price: ${asset['price']:,.2f}\n\n"
+            f"How much to sell?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif data == "cancel_order":
+        await query.edit_message_text("❌ Order cancelled")
+    
+    elif data == "clear_all_alerts":
+        price_alerts.clear()
+        save_positions()
+        await query.edit_message_text("✅ All alerts cleared")
+    
+    elif data == "export_history":
+        if not trade_history:
+            await query.edit_message_text("📭 No trade history to export")
+            return
+        
+        # Create CSV
+        csv_lines = ["Date,Pair,Entry,Exit,P&L %,P&L $,Strategy"]
+        for trade in trade_history:
+            date = trade.get("closed_at", "")[:10]
+            csv_lines.append(
+                f"{date},{trade.get('pair')},{trade.get('entry')},{trade.get('exit')},"
+                f"{trade.get('pnl_pct')},{trade.get('pnl_usd')},{trade.get('strategy')}"
+            )
+        
+        csv_text = "\n".join(csv_lines)
+        
+        await query.edit_message_text(
+            f"📤 <b>TRADE HISTORY EXPORT</b>\n\n"
+            f"<code>{csv_text[:2000]}</code>\n\n"
+            f"<i>Copy the above CSV data</i>",
+            parse_mode="HTML"
+        )
 
 
 # ============ REGISTER HANDLERS ============
@@ -2043,12 +2626,19 @@ tg_app.add_handler(CommandHandler("tf", timeframe_cmd))
 tg_app.add_handler(CommandHandler("backtest", backtest_cmd))
 tg_app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
 tg_app.add_handler(CommandHandler("alert", alert_cmd))
+tg_app.add_handler(CommandHandler("alerts", alerts_cmd))
 tg_app.add_handler(CommandHandler("dca", dca_cmd))
 tg_app.add_handler(CommandHandler("autopilot", autopilot_cmd))
 tg_app.add_handler(CommandHandler("pause", pause_cmd))
 tg_app.add_handler(CommandHandler("regime", regime_cmd))
 tg_app.add_handler(CommandHandler("strategies", strategies_cmd))
 tg_app.add_handler(CommandHandler("stats", stats_cmd))
+# New commands
+tg_app.add_handler(CommandHandler("buy", buy_cmd))
+tg_app.add_handler(CommandHandler("sell", sell_cmd))
+tg_app.add_handler(CommandHandler("limit", limit_cmd))
+tg_app.add_handler(CommandHandler("history", history_cmd))
+tg_app.add_handler(CommandHandler("performance", performance_cmd))
 tg_app.add_handler(CallbackQueryHandler(button_callback))
 
 
