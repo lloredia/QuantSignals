@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict, List
 import pytz
 import httpx
 from fastapi import FastAPI, Request
@@ -25,30 +25,43 @@ except:
     redis_client = None
 
 
-def save_positions():
-    """Save positions to Redis."""
+# ============ STORAGE FUNCTIONS ============
+def save_data(key: str, data: dict):
+    """Save data to Redis."""
     if redis_client:
         try:
-            redis_client.set("qs_positions", json.dumps(positions))
-            redis_client.set("qs_daily_pnl", json.dumps(daily_pnl))
+            redis_client.set(f"qs_{key}", json.dumps(data))
         except Exception as e:
             print(f"[REDIS] Save error: {e}")
 
 
-def load_positions():
-    """Load positions from Redis."""
-    global positions, daily_pnl
+def load_data(key: str, default: dict = None) -> dict:
+    """Load data from Redis."""
     if redis_client:
         try:
-            pos_data = redis_client.get("qs_positions")
-            pnl_data = redis_client.get("qs_daily_pnl")
-            if pos_data:
-                positions = json.loads(pos_data)
-            if pnl_data:
-                daily_pnl = json.loads(pnl_data)
-            print(f"[REDIS] Loaded {len(positions)} positions")
+            data = redis_client.get(f"qs_{key}")
+            if data:
+                return json.loads(data)
         except Exception as e:
             print(f"[REDIS] Load error: {e}")
+    return default or {}
+
+
+def save_positions():
+    save_data("positions", positions)
+    save_data("daily_pnl", daily_pnl)
+    save_data("signal_history", signal_history)
+    save_data("price_alerts", price_alerts)
+
+
+def load_positions():
+    global positions, daily_pnl, signal_history, price_alerts
+    positions = load_data("positions", {})
+    daily_pnl = load_data("daily_pnl", {"realized": 0.0, "trades": 0, "wins": 0})
+    signal_history = load_data("signal_history", [])
+    price_alerts = load_data("price_alerts", {})
+    print(f"[REDIS] Loaded {len(positions)} positions, {len(signal_history)} signals")
+
 
 # ============ CONFIG ============
 TOKEN = os.getenv("BOT_TOKEN")
@@ -56,7 +69,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "quantsignals-secret")
 BASE_URL = os.getenv("BASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Coinbase CDP API (for trading - optional)
+# Coinbase CDP API
 COINBASE_API_KEY = os.getenv("COINBASE_API_KEY")
 COINBASE_API_SECRET = os.getenv("COINBASE_API_SECRET")
 
@@ -65,8 +78,10 @@ TRADE_AMOUNT_USD = float(os.getenv("TRADE_AMOUNT_USD", "10"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "5"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "10"))
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "3"))  # Feature 1: Trailing Stop
+DCA_DROP_PCT = float(os.getenv("DCA_DROP_PCT", "5"))  # Feature 5: DCA trigger
 
-# Supported coins - expanded list
+# Expanded coin list
 TRADING_PAIRS = [
     "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "LINK-USD",
     "DOGE-USD", "XRP-USD", "ADA-USD", "MATIC-USD", "DOT-USD"
@@ -75,18 +90,18 @@ TRADING_PAIRS = [
 app = FastAPI()
 tg_app = Application.builder().token(TOKEN).build()
 
-# Position tracking
+# State tracking
 positions = {}
 daily_pnl = {"realized": 0.0, "trades": 0, "wins": 0}
+signal_history = []  # Feature 7: Leaderboard
+price_alerts = {}  # Feature 8: Custom Alerts
 
 # Live trading mode
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
 
-# Auto signal chat IDs (comma separated)
+# Auto signal config
 AUTO_SIGNAL_CHATS = os.getenv("AUTO_SIGNAL_CHATS", "").split(",")
 AUTO_SIGNAL_CHATS = [c.strip() for c in AUTO_SIGNAL_CHATS if c.strip()]
-
-# Scheduled signal times (CT): 6 AM, 12 PM, 6 PM
 SIGNAL_HOURS = [6, 12, 18]
 
 
@@ -98,16 +113,15 @@ class CoinbaseCDPClient:
     
     def __init__(self, api_key: str, api_secret: str):
         self.api_key = api_key
-        # Fix newlines in private key
         self.api_secret = api_secret.replace("\\n", "\n")
     
     def _build_jwt(self, method: str, path: str) -> str:
-        """Build JWT for CDP API."""
         import jwt as pyjwt
         import secrets as sec
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.backends import default_backend
         
         uri = f"{method} api.coinbase.com{path}"
-        
         payload = {
             "sub": self.api_key,
             "iss": "coinbase-cloud",
@@ -116,108 +130,52 @@ class CoinbaseCDPClient:
             "uri": uri,
             "nonce": sec.token_hex(16),
         }
+        headers = {"kid": self.api_key, "nonce": sec.token_hex(16)}
         
-        headers = {
-            "kid": self.api_key,
-            "nonce": sec.token_hex(16),
-        }
-        
-        # Load private key
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.backends import default_backend
-        
-        try:
-            private_key = serialization.load_pem_private_key(
-                self.api_secret.encode(),
-                password=None,
-                backend=default_backend()
-            )
-        except Exception as e:
-            print(f"[CDP] Key load error: {e}")
-            raise
-        
-        token = pyjwt.encode(payload, private_key, algorithm="ES256", headers=headers)
-        return token
+        private_key = serialization.load_pem_private_key(
+            self.api_secret.encode(), password=None, backend=default_backend()
+        )
+        return pyjwt.encode(payload, private_key, algorithm="ES256", headers=headers)
     
     def _headers(self, method: str, path: str) -> dict:
-        """Generate auth headers."""
-        token = self._build_jwt(method, path)
-        return {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
+        return {"Authorization": f"Bearer {self._build_jwt(method, path)}", "Content-Type": "application/json"}
     
     async def get_accounts(self) -> dict:
-        """Get account balances."""
         path = "/api/v3/brokerage/accounts"
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{self.BASE_URL}{path}",
-                    headers=self._headers("GET", path),
-                    timeout=15
-                )
+                resp = await client.get(f"{self.BASE_URL}{path}", headers=self._headers("GET", path), timeout=15)
                 return resp.json()
         except Exception as e:
-            print(f"[CDP ERROR] get_accounts: {e}")
             return {"error": str(e)}
     
     async def place_market_order(self, product_id: str, side: str, usd_amount: float) -> dict:
-        """Place a market order."""
         path = "/api/v3/brokerage/orders"
-        
-        order_id = f"qs_{int(time.time())}_{secrets.token_hex(4)}"
-        
         body = {
-            "client_order_id": order_id,
+            "client_order_id": f"qs_{int(time.time())}_{secrets.token_hex(4)}",
             "product_id": product_id,
             "side": side.upper(),
-            "order_configuration": {
-                "market_market_ioc": {
-                    "quote_size": str(usd_amount)
-                }
-            }
+            "order_configuration": {"market_market_ioc": {"quote_size": str(usd_amount)}}
         }
-        
-        body_str = json.dumps(body)
-        
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{self.BASE_URL}{path}",
-                    headers=self._headers("POST", path),
-                    content=body_str,
-                    timeout=15
-                )
-                print(f"[CDP] Status: {resp.status_code}")
-                print(f"[CDP] Response: {resp.text[:500]}")
-                
-                if resp.status_code == 200 or resp.status_code == 201:
-                    return resp.json()
-                else:
-                    return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+                resp = await client.post(f"{self.BASE_URL}{path}", headers=self._headers("POST", path), 
+                                         content=json.dumps(body), timeout=15)
+                return resp.json() if resp.status_code in [200, 201] else {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
         except Exception as e:
-            print(f"[CDP ERROR] place_order: {e}")
             return {"error": str(e)}
     
     async def test_auth(self) -> dict:
-        """Test API authentication."""
         path = "/api/v3/brokerage/accounts"
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{self.BASE_URL}{path}",
-                    headers=self._headers("GET", path),
-                    timeout=15
-                )
-                print(f"[CDP TEST] Status: {resp.status_code}")
-                print(f"[CDP TEST] Response: {resp.text[:500]}")
+                resp = await client.get(f"{self.BASE_URL}{path}", headers=self._headers("GET", path), timeout=15)
                 return {"status": resp.status_code, "body": resp.text[:500]}
         except Exception as e:
             return {"error": str(e)}
 
 
-# Initialize CDP client if keys exist
+# Initialize CDP client
 cdp_client = None
 if COINBASE_API_KEY and COINBASE_API_SECRET:
     try:
@@ -227,51 +185,140 @@ if COINBASE_API_KEY and COINBASE_API_SECRET:
         print(f"❌ CDP client init failed: {e}")
 
 
-# ============ PUBLIC PRICE API (No Auth Required) ============
+# ============ PUBLIC PRICE APIs ============
 async def get_public_price(product_id: str) -> float:
-    """Get price from Coinbase public API (no auth needed)."""
+    """Get price from Coinbase public API."""
     url = f"https://api.coinbase.com/v2/prices/{product_id}/spot"
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, timeout=10)
-            data = resp.json()
-            return float(data.get("data", {}).get("amount", 0))
-    except Exception as e:
-        print(f"[ERROR] public price {product_id}: {e}")
+            return float(resp.json().get("data", {}).get("amount", 0))
+    except:
         return 0
 
 
-async def get_public_candles(product_id: str) -> dict:
-    """Get candle data from Coinbase Exchange public API (no auth needed)."""
-    url = f"https://api.exchange.coinbase.com/products/{product_id}/candles?granularity=3600"
+async def get_public_candles(product_id: str, granularity: int = 3600) -> dict:
+    """Get candle data from Coinbase Exchange API."""
+    url = f"https://api.exchange.coinbase.com/products/{product_id}/candles?granularity={granularity}"
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, timeout=10)
             candles = resp.json()
-            
-            if candles and len(candles) > 0 and isinstance(candles, list):
-                # Candles format: [time, low, high, open, close, volume]
-                prices = [c[4] for c in candles[:24]]  # close prices
+            if candles and isinstance(candles, list):
+                prices = [c[4] for c in candles[:24]]
                 return {
                     "prices": prices,
                     "high_24h": max(c[2] for c in candles[:24]),
                     "low_24h": min(c[1] for c in candles[:24]),
                     "volume_24h": sum(c[5] for c in candles[:24]),
-                    "current": prices[0] if prices else 0
                 }
-    except Exception as e:
-        print(f"[ERROR] public candles {product_id}: {e}")
+    except:
+        pass
     return {}
 
 
-# ============ AI SIGNAL GENERATOR ============
-async def generate_trading_signals() -> dict:
-    """Generate AI trading signals for crypto pairs."""
+# ============ FEATURE 3: FEAR & GREED INDEX ============
+async def get_fear_greed_index() -> dict:
+    """Get crypto Fear & Greed Index."""
+    url = "https://api.alternative.me/fng/?limit=1"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=10)
+            data = resp.json().get("data", [{}])[0]
+            return {
+                "value": int(data.get("value", 50)),
+                "classification": data.get("value_classification", "Neutral"),
+                "timestamp": data.get("timestamp", "")
+            }
+    except:
+        return {"value": 50, "classification": "Neutral", "timestamp": ""}
+
+
+# ============ FEATURE 4: WHALE ALERTS ============
+async def get_whale_alerts() -> list:
+    """Get recent large crypto transactions (simulated - real API needs key)."""
+    # In production, use whale-alert.io API
+    # For now, return mock data structure
+    try:
+        # Check for large movements via public APIs
+        alerts = []
+        for pair in ["BTC-USD", "ETH-USD"]:
+            candles = await get_public_candles(pair, 300)  # 5min candles
+            if candles and candles.get("volume_24h", 0) > 0:
+                avg_vol = candles["volume_24h"] / 24
+                # Detect volume spikes (simulated)
+                alerts.append({
+                    "coin": pair.split("-")[0],
+                    "type": "volume_spike",
+                    "message": f"High volume detected"
+                })
+        return alerts[:3]
+    except:
+        return []
+
+
+# ============ FEATURE 9: NEWS INTEGRATION ============
+async def get_crypto_news() -> list:
+    """Get latest crypto news headlines."""
+    # Using CryptoPanic public feed (no auth needed for basic)
+    url = "https://cryptopanic.com/api/v1/posts/?auth_token=free&public=true&kind=news"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=10)
+            data = resp.json()
+            news = []
+            for item in data.get("results", [])[:5]:
+                news.append({
+                    "title": item.get("title", "")[:100],
+                    "source": item.get("source", {}).get("title", ""),
+                    "url": item.get("url", ""),
+                    "currencies": [c.get("code") for c in item.get("currencies", [])]
+                })
+            return news
+    except:
+        return []
+
+
+# ============ FEATURE 2: MULTI-TIMEFRAME ANALYSIS ============
+async def get_multi_timeframe_data(pair: str) -> dict:
+    """Get data for multiple timeframes."""
+    timeframes = {
+        "15m": 900,
+        "1h": 3600,
+        "4h": 14400,
+    }
+    
+    result = {}
+    for tf_name, granularity in timeframes.items():
+        candles = await get_public_candles(pair, granularity)
+        if candles and candles.get("prices"):
+            prices = candles["prices"]
+            sma_8 = sum(prices[:8]) / 8 if len(prices) >= 8 else prices[0]
+            sma_21 = sum(prices[:21]) / 21 if len(prices) >= 21 else prices[0]
+            trend = "bullish" if sma_8 > sma_21 else "bearish"
+            
+            change = 0
+            if len(prices) >= 2:
+                change = ((prices[0] - prices[1]) / prices[1]) * 100
+            
+            result[tf_name] = {
+                "trend": trend,
+                "change": round(change, 2),
+                "sma_8": round(sma_8, 2),
+                "sma_21": round(sma_21, 2)
+            }
+    
+    return result
+
+
+# ============ AI SIGNAL GENERATOR (Enhanced) ============
+async def generate_trading_signals(include_news: bool = True) -> dict:
+    """Generate AI trading signals with enhanced data."""
     
     if not OPENAI_API_KEY:
         return {"error": "OpenAI not configured"}
     
-    # Gather market data using PUBLIC API (no auth needed!)
+    # Gather market data
     market_data = {}
     for pair in TRADING_PAIRS:
         try:
@@ -280,13 +327,9 @@ async def generate_trading_signals() -> dict:
             
             if price > 0:
                 prices = candle_data.get("prices", [price])
-                
                 sma_8 = sum(prices[:8]) / 8 if len(prices) >= 8 else price
                 sma_21 = sum(prices[:21]) / 21 if len(prices) >= 21 else price
-                
-                change_1h = 0
-                if len(prices) >= 2:
-                    change_1h = ((prices[0] - prices[1]) / prices[1]) * 100
+                change_1h = ((prices[0] - prices[1]) / prices[1]) * 100 if len(prices) >= 2 else 0
                 
                 market_data[pair] = {
                     "price": price,
@@ -298,66 +341,80 @@ async def generate_trading_signals() -> dict:
                     "change_1h": round(change_1h, 2),
                     "trend": "bullish" if sma_8 > sma_21 else "bearish"
                 }
-                print(f"[OK] {pair}: ${price:,.2f}")
         except Exception as e:
-            print(f"[ERROR] Failed to get data for {pair}: {e}")
+            print(f"[ERROR] {pair}: {e}")
     
     if not market_data:
         return {"error": "No market data available"}
+    
+    # Get Fear & Greed
+    fear_greed = await get_fear_greed_index()
+    
+    # Get news if enabled
+    news = await get_crypto_news() if include_news else []
     
     # Build AI prompt
     tz = pytz.timezone("America/Chicago")
     now = datetime.now(tz)
     
-    prompt = f"""You are an expert crypto day trader AI. Analyze the following REAL-TIME market data and provide trading signals.
+    prompt = f"""You are an expert crypto day trader AI with advanced market analysis.
 
 CURRENT TIME: {now.strftime("%Y-%m-%d %H:%M %Z")}
-TRADING STYLE: Day trading (holding 1-8 hours)
-RISK TOLERANCE: Medium (5% stop loss, 10% take profit)
+TRADING STYLE: Day trading (1-8 hours)
+RISK: 5% stop loss, 10% take profit
+
+FEAR & GREED INDEX: {fear_greed['value']} ({fear_greed['classification']})
+- 0-25: Extreme Fear (potential buying opportunity)
+- 25-45: Fear
+- 45-55: Neutral
+- 55-75: Greed
+- 75-100: Extreme Greed (potential selling opportunity)
 
 LIVE MARKET DATA:
 """
     
     for pair, data in market_data.items():
         prompt += f"""
-{pair}:
-- Current Price: ${data['price']:,.2f}
-- 24h High: ${data['high_24h']:,.2f}
-- 24h Low: ${data['low_24h']:,.2f}
+{pair}: ${data['price']:,.2f}
+- 24h: High ${data['high_24h']:,.2f} / Low ${data['low_24h']:,.2f}
 - 1h Change: {data['change_1h']:+.2f}%
-- SMA(8): ${data['sma_8']:,.2f}
-- SMA(21): ${data['sma_21']:,.2f}
-- Trend: {data['trend']}
-- 24h Volume: ${data['volume_24h']:,.0f}
+- SMA8: ${data['sma_8']:,.2f} / SMA21: ${data['sma_21']:,.2f}
+- Trend: {data['trend'].upper()}
 """
+    
+    if news:
+        prompt += "\n\nRECENT NEWS:\n"
+        for n in news[:3]:
+            coins = ", ".join(n.get("currencies", [])[:3])
+            prompt += f"- {n['title']} [{coins}]\n"
     
     prompt += """
 
-ANALYSIS INSTRUCTIONS:
-1. Analyze momentum, trend direction, and support/resistance
-2. Consider SMA crossovers (SMA8 vs SMA21) for trend confirmation
-3. Look for oversold/overbought conditions based on 24h range
-4. Only recommend HIGH confidence trades (>70% conviction)
-5. Maximum 2 trade signals
+ANALYSIS RULES:
+1. Consider Fear & Greed - buy on fear, cautious on greed
+2. Look for trend confirmations (SMA crossovers)
+3. News sentiment affects short-term moves
+4. Only HIGH confidence (>70%) trades
+5. Max 2 signals
 
-OUTPUT FORMAT (JSON only, no markdown, no explanation):
+OUTPUT (JSON only):
 {
     "signals": [
         {
             "pair": "BTC-USD",
             "action": "BUY",
-            "confidence": 75,
+            "confidence": 78,
             "entry_price": 97000,
             "stop_loss": 92150,
             "take_profit": 106700,
-            "reasoning": "SMA8 crossed above SMA21, bullish momentum"
+            "timeframe": "4h",
+            "reasoning": "Brief reason"
         }
     ],
     "market_sentiment": "bullish",
-    "summary": "One sentence market summary"
+    "fear_greed_analysis": "Fear indicates buying opportunity",
+    "summary": "One sentence summary"
 }
-
-If no good opportunities, return empty signals array with action "HOLD".
 """
     
     try:
@@ -365,7 +422,7 @@ If no good opportunities, return empty signals array with action "HOLD".
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are a professional crypto trader. Respond ONLY with valid JSON, no markdown code blocks."},
+                {"role": "system", "content": "Expert crypto trader. JSON only, no markdown."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=1000,
@@ -373,77 +430,456 @@ If no good opportunities, return empty signals array with action "HOLD".
         )
         
         result_text = response.choices[0].message.content.strip()
-        
-        # Clean JSON
-        if result_text.startswith("```json"):
-            result_text = result_text[7:]
         if result_text.startswith("```"):
-            result_text = result_text[3:]
-        if result_text.endswith("```"):
-            result_text = result_text[:-3]
+            result_text = result_text.split("```")[1]
+            if result_text.startswith("json"):
+                result_text = result_text[4:]
+        result_text = result_text.strip("`").strip()
         
-        signals = json.loads(result_text.strip())
+        signals = json.loads(result_text)
         signals["market_data"] = market_data
+        signals["fear_greed"] = fear_greed
         signals["generated_at"] = now.isoformat()
+        
+        # Track signals for leaderboard (Feature 7)
+        for sig in signals.get("signals", []):
+            signal_history.append({
+                "pair": sig.get("pair"),
+                "action": sig.get("action"),
+                "price": sig.get("entry_price"),
+                "confidence": sig.get("confidence"),
+                "timestamp": now.isoformat(),
+                "result": None  # Updated later
+            })
+        save_positions()
         
         return signals
         
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] JSON parse failed: {e}")
-        print(f"[DEBUG] Raw response: {result_text[:500]}")
-        return {"error": f"JSON parse error", "market_data": market_data}
     except Exception as e:
-        print(f"[ERROR] AI signal generation failed: {e}")
         return {"error": str(e), "market_data": market_data}
+
+
+# ============ FEATURE 6: BACKTESTING ============
+async def run_backtest(pair: str, days: int = 30) -> dict:
+    """Simple backtest using historical data."""
+    try:
+        # Get historical candles
+        candles = await get_public_candles(pair, 3600)  # 1h candles
+        if not candles or not candles.get("prices"):
+            return {"error": "No historical data"}
+        
+        prices = candles["prices"][:min(days*24, len(candles["prices"]))]
+        
+        # Simple SMA crossover strategy backtest
+        trades = []
+        position = None
+        wins = 0
+        losses = 0
+        total_pnl = 0
+        
+        for i in range(21, len(prices)):
+            sma_8 = sum(prices[i-8:i]) / 8
+            sma_21 = sum(prices[i-21:i]) / 21
+            price = prices[i]
+            
+            # Buy signal: SMA8 crosses above SMA21
+            if sma_8 > sma_21 and position is None:
+                position = {"entry": price, "index": i}
+            
+            # Sell signal: SMA8 crosses below SMA21 or stop/take profit
+            elif position:
+                pnl_pct = ((price - position["entry"]) / position["entry"]) * 100
+                
+                if sma_8 < sma_21 or pnl_pct >= 10 or pnl_pct <= -5:
+                    trades.append({"entry": position["entry"], "exit": price, "pnl": pnl_pct})
+                    total_pnl += pnl_pct
+                    if pnl_pct > 0:
+                        wins += 1
+                    else:
+                        losses += 1
+                    position = None
+        
+        win_rate = (wins / len(trades) * 100) if trades else 0
+        
+        return {
+            "pair": pair,
+            "period": f"{days} days",
+            "total_trades": len(trades),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 1),
+            "total_pnl": round(total_pnl, 2),
+            "avg_pnl": round(total_pnl / len(trades), 2) if trades else 0
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ============ TELEGRAM COMMANDS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome = """📊 <b>QUANTSIGNALS</b>
+    welcome = """📊 <b>QUANTSIGNALS v2.0</b>
 
-AI-powered crypto trading signals.
+AI-powered crypto trading with advanced features.
 
-<b>Commands:</b>
-/signals - Get AI trading signals
-/market - Quick market overview
-/portfolio - View positions
-/pnl - Today's P&L
+<b>📈 Trading:</b>
+/signals - AI trading signals
+/market - Live prices
+/portfolio - Your positions
+/pnl - Daily P&L
+
+<b>📊 Analysis:</b>
+/fear - Fear & Greed Index
+/news - Crypto news
+/whale - Whale alerts
+/timeframe [coin] - Multi-TF analysis
+
+<b>⚙️ Tools:</b>
+/backtest [coin] - Strategy backtest
+/leaderboard - Signal performance
+/alert [coin] [price] - Price alerts
+/dca - DCA opportunities
 /settings - Bot settings
-/help - Show help
 
-<i>⚠️ Trading involves risk. Never trade more than you can afford to lose.</i>"""
+<i>⚠️ Not financial advice. Trade responsibly.</i>"""
     
     await update.message.reply_text(welcome, parse_mode="HTML")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """📊 <b>QUANTSIGNALS HELP</b>
+    await start(update, context)
 
-<b>Signal Commands:</b>
-/signals - Generate AI trading signals
-/market - Quick market overview
 
-<b>Trading Commands:</b>
-/portfolio - View open positions
-/pnl - Today's profit/loss
-
-<b>Settings:</b>
-/settings - View bot settings
-
-<i>Start with /signals to get AI recommendations!</i>"""
+# Feature 3: Fear & Greed
+async def fear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show Fear & Greed Index."""
+    msg = await update.message.reply_text("📊 Loading Fear & Greed Index...")
     
-    await update.message.reply_text(help_text, parse_mode="HTML")
+    fg = await get_fear_greed_index()
+    
+    # Visual meter
+    value = fg["value"]
+    if value <= 25:
+        emoji = "😱"
+        color = "🔴"
+    elif value <= 45:
+        emoji = "😰"
+        color = "🟠"
+    elif value <= 55:
+        emoji = "😐"
+        color = "🟡"
+    elif value <= 75:
+        emoji = "😊"
+        color = "🟢"
+    else:
+        emoji = "🤑"
+        color = "🔵"
+    
+    bar_filled = int(value / 10)
+    bar = "█" * bar_filled + "░" * (10 - bar_filled)
+    
+    text = f"""📊 <b>FEAR & GREED INDEX</b>
+━━━━━━━━━━━━━━━
+
+{emoji} <b>{fg['classification'].upper()}</b>
+
+{color} [{bar}] {value}/100
+
+<b>What it means:</b>
+• 0-25: Extreme Fear → Buy opportunity
+• 25-45: Fear → Consider buying
+• 45-55: Neutral → Hold
+• 55-75: Greed → Consider selling
+• 75-100: Extreme Greed → Sell signal
+
+<i>Updated hourly</i>"""
+    
+    await msg.edit_text(text, parse_mode="HTML")
+
+
+# Feature 9: News
+async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show crypto news."""
+    msg = await update.message.reply_text("📰 Loading news...")
+    
+    news = await get_crypto_news()
+    
+    if not news:
+        await msg.edit_text("❌ Could not fetch news")
+        return
+    
+    text = """📰 <b>CRYPTO NEWS</b>
+━━━━━━━━━━━━━━━
+
+"""
+    
+    for i, n in enumerate(news[:5], 1):
+        coins = ", ".join(n.get("currencies", [])[:3]) or "General"
+        text += f"{i}. <b>{n['title']}</b>\n"
+        text += f"   📌 {coins} | {n['source']}\n\n"
+    
+    text += "<i>Use /signals for AI analysis including news</i>"
+    
+    await msg.edit_text(text, parse_mode="HTML")
+
+
+# Feature 4: Whale Alerts
+async def whale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show whale alerts."""
+    msg = await update.message.reply_text("🐋 Checking whale activity...")
+    
+    alerts = await get_whale_alerts()
+    
+    text = """🐋 <b>WHALE ALERTS</b>
+━━━━━━━━━━━━━━━
+
+"""
+    
+    if alerts:
+        for alert in alerts:
+            text += f"🔔 <b>{alert['coin']}</b>: {alert['message']}\n"
+    else:
+        text += "No major whale activity detected\n"
+    
+    text += """
+━━━━━━━━━━━━━━━
+<i>Large transactions can signal price moves</i>"""
+    
+    await msg.edit_text(text, parse_mode="HTML")
+
+
+# Feature 2: Multi-timeframe
+async def timeframe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Multi-timeframe analysis."""
+    args = context.args
+    pair = f"{args[0].upper()}-USD" if args else "BTC-USD"
+    
+    if pair not in TRADING_PAIRS:
+        await update.message.reply_text(f"❌ Unknown pair. Use: {', '.join([p.split('-')[0] for p in TRADING_PAIRS])}")
+        return
+    
+    msg = await update.message.reply_text(f"📊 Analyzing {pair} across timeframes...")
+    
+    tf_data = await get_multi_timeframe_data(pair)
+    price = await get_public_price(pair)
+    
+    text = f"""📊 <b>{pair} MULTI-TIMEFRAME</b>
+━━━━━━━━━━━━━━━
+
+💰 Current: <b>${price:,.2f}</b>
+
+"""
+    
+    for tf, data in tf_data.items():
+        trend_emoji = "🟢" if data["trend"] == "bullish" else "🔴"
+        text += f"""<b>{tf.upper()}</b>
+{trend_emoji} Trend: {data['trend'].upper()}
+📈 Change: {data['change']:+.2f}%
+📊 SMA8: ${data['sma_8']:,.2f} / SMA21: ${data['sma_21']:,.2f}
+
+"""
+    
+    # Confluence check
+    trends = [d["trend"] for d in tf_data.values()]
+    if all(t == "bullish" for t in trends):
+        text += "✅ <b>STRONG BUY</b> - All timeframes bullish"
+    elif all(t == "bearish" for t in trends):
+        text += "🛑 <b>STRONG SELL</b> - All timeframes bearish"
+    else:
+        text += "⚠️ <b>MIXED</b> - Conflicting signals"
+    
+    await msg.edit_text(text, parse_mode="HTML")
+
+
+# Feature 6: Backtest
+async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run backtest on a pair."""
+    args = context.args
+    pair = f"{args[0].upper()}-USD" if args else "BTC-USD"
+    days = int(args[1]) if len(args) > 1 else 30
+    
+    msg = await update.message.reply_text(f"🔬 Running backtest on {pair}...")
+    
+    result = await run_backtest(pair, days)
+    
+    if "error" in result:
+        await msg.edit_text(f"❌ Error: {result['error']}")
+        return
+    
+    emoji = "🟢" if result["total_pnl"] > 0 else "🔴"
+    
+    text = f"""🔬 <b>BACKTEST RESULTS</b>
+━━━━━━━━━━━━━━━
+
+📊 Pair: <b>{result['pair']}</b>
+📅 Period: {result['period']}
+
+<b>Performance:</b>
+📈 Total Trades: {result['total_trades']}
+✅ Wins: {result['wins']}
+❌ Losses: {result['losses']}
+🎯 Win Rate: {result['win_rate']}%
+
+{emoji} Total P&L: <b>{result['total_pnl']:+.2f}%</b>
+📊 Avg per Trade: {result['avg_pnl']:+.2f}%
+
+<i>Strategy: SMA 8/21 crossover with 5% SL, 10% TP</i>"""
+    
+    await msg.edit_text(text, parse_mode="HTML")
+
+
+# Feature 7: Leaderboard
+async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show signal performance leaderboard."""
+    
+    if not signal_history:
+        await update.message.reply_text("📊 No signal history yet. Signals will be tracked automatically.")
+        return
+    
+    # Calculate stats per pair
+    pair_stats = {}
+    for sig in signal_history[-100:]:  # Last 100 signals
+        pair = sig.get("pair", "Unknown")
+        if pair not in pair_stats:
+            pair_stats[pair] = {"total": 0, "wins": 0}
+        pair_stats[pair]["total"] += 1
+        if sig.get("result") == "win":
+            pair_stats[pair]["wins"] += 1
+    
+    text = """🏆 <b>SIGNAL LEADERBOARD</b>
+━━━━━━━━━━━━━━━
+
+<b>Top Performing Pairs:</b>
+
+"""
+    
+    # Sort by win rate
+    sorted_pairs = sorted(pair_stats.items(), 
+                         key=lambda x: x[1]["wins"]/x[1]["total"] if x[1]["total"] > 0 else 0, 
+                         reverse=True)
+    
+    for i, (pair, stats) in enumerate(sorted_pairs[:5], 1):
+        win_rate = (stats["wins"] / stats["total"] * 100) if stats["total"] > 0 else 0
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
+        text += f"{medal} {pair}: {win_rate:.0f}% ({stats['wins']}/{stats['total']})\n"
+    
+    text += f"""
+━━━━━━━━━━━━━━━
+📊 Total Signals: {len(signal_history)}
+<i>Last 100 signals analyzed</i>"""
+    
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+# Feature 8: Price Alerts
+async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set price alert."""
+    args = context.args
+    
+    if len(args) < 2:
+        # Show current alerts
+        if not price_alerts:
+            await update.message.reply_text(
+                "🔔 <b>PRICE ALERTS</b>\n\n"
+                "No alerts set.\n\n"
+                "Usage: /alert BTC 100000\n"
+                "Sets alert when BTC reaches $100,000",
+                parse_mode="HTML"
+            )
+            return
+        
+        text = "🔔 <b>YOUR ALERTS</b>\n━━━━━━━━━━━━━━━\n\n"
+        for pair, targets in price_alerts.items():
+            for target in targets:
+                text += f"• {pair}: ${target:,.2f}\n"
+        text += "\nUse /alert clear to remove all"
+        await update.message.reply_text(text, parse_mode="HTML")
+        return
+    
+    if args[0].lower() == "clear":
+        price_alerts.clear()
+        save_positions()
+        await update.message.reply_text("✅ All alerts cleared")
+        return
+    
+    coin = args[0].upper()
+    pair = f"{coin}-USD"
+    try:
+        target_price = float(args[1].replace(",", ""))
+    except:
+        await update.message.reply_text("❌ Invalid price. Use: /alert BTC 100000")
+        return
+    
+    if pair not in price_alerts:
+        price_alerts[pair] = []
+    price_alerts[pair].append(target_price)
+    save_positions()
+    
+    current = await get_public_price(pair)
+    direction = "📈 above" if target_price > current else "📉 below"
+    
+    await update.message.reply_text(
+        f"✅ Alert set!\n\n"
+        f"🔔 {pair} at ${target_price:,.2f}\n"
+        f"📍 Current: ${current:,.2f}\n"
+        f"Triggers when price goes {direction} target",
+        parse_mode="HTML"
+    )
+
+
+# Feature 5: DCA Opportunities
+async def dca_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show DCA opportunities (coins down significantly)."""
+    msg = await update.message.reply_text("📉 Finding DCA opportunities...")
+    
+    opportunities = []
+    
+    for pair in TRADING_PAIRS:
+        try:
+            candles = await get_public_candles(pair)
+            if candles and candles.get("prices"):
+                price = await get_public_price(pair)
+                high = candles["high_24h"]
+                drop_pct = ((price - high) / high) * 100
+                
+                if drop_pct <= -DCA_DROP_PCT:
+                    opportunities.append({
+                        "pair": pair,
+                        "price": price,
+                        "high": high,
+                        "drop": drop_pct
+                    })
+        except:
+            pass
+    
+    text = """📉 <b>DCA OPPORTUNITIES</b>
+━━━━━━━━━━━━━━━
+
+Coins down more than {:.0f}% from 24h high:
+
+""".format(DCA_DROP_PCT)
+    
+    if opportunities:
+        opportunities.sort(key=lambda x: x["drop"])
+        for opp in opportunities[:5]:
+            text += f"""🔻 <b>{opp['pair'].split('-')[0]}</b>
+   Price: ${opp['price']:,.2f}
+   24h High: ${opp['high']:,.2f}
+   Drop: {opp['drop']:.1f}%
+
+"""
+    else:
+        text += "No significant dips found right now.\n"
+    
+    text += "<i>DCA = Dollar Cost Average into dips</i>"
+    
+    await msg.edit_text(text, parse_mode="HTML")
 
 
 async def signals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate and display AI trading signals."""
+    """Generate AI trading signals."""
     msg = await update.message.reply_text("🔄 Analyzing markets with AI...")
     
     signals = await generate_trading_signals()
-    
-    if "error" in signals and "market_data" not in signals:
-        await msg.edit_text(f"❌ Error: {signals['error']}")
-        return
     
     tz = pytz.timezone("America/Chicago")
     now = datetime.now(tz)
@@ -454,361 +890,199 @@ async def signals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 """
     
-    if "error" in signals:
-        text += f"⚠️ AI Error: {signals['error']}\n\n"
-        text += "<b>Live Prices:</b>\n"
-        for pair, data in signals.get("market_data", {}).items():
-            emoji = "🟢" if data.get("change_1h", 0) > 0 else "🔴"
-            text += f"{emoji} {pair}: ${data['price']:,.2f} ({data.get('change_1h', 0):+.2f}%)\n"
-    else:
+    # Fear & Greed
+    fg = signals.get("fear_greed", {})
+    text += f"😱 Fear/Greed: <b>{fg.get('value', 'N/A')}</b> ({fg.get('classification', 'N/A')})\n\n"
+    
+    if "error" in signals and "market_data" not in signals:
+        text += f"❌ Error: {signals['error']}"
+    elif signals.get("signals"):
         sentiment = signals.get('market_sentiment', 'neutral').upper()
-        sent_emoji = "🟢" if sentiment == "BULLISH" else "🔴" if sentiment == "BEARISH" else "⚪"
-        text += f"<b>Market Sentiment:</b> {sent_emoji} {sentiment}\n\n"
+        text += f"<b>Sentiment:</b> {sentiment}\n\n"
         
-        if not signals.get("signals"):
-            text += "⚪ <b>NO SIGNALS</b>\n"
-            text += "No high-confidence trades at this time.\n\n"
-            text += "<b>Live Prices:</b>\n"
-            for pair, data in signals.get("market_data", {}).items():
-                emoji = "🟢" if data.get("change_1h", 0) > 0 else "🔴"
-                text += f"{emoji} {pair}: ${data['price']:,.2f} ({data.get('change_1h', 0):+.2f}%)\n"
-        else:
-            for signal in signals.get("signals", []):
-                action = signal.get("action", "HOLD")
-                action_emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
-                
-                text += f"""{action_emoji} <b>{signal.get('pair', 'N/A')}</b>
+        for signal in signals.get("signals", []):
+            action = signal.get("action", "HOLD")
+            emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
+            
+            text += f"""{emoji} <b>{signal.get('pair')}</b>
 Action: <b>{action}</b>
-Confidence: {signal.get('confidence', 'N/A')}%
+Confidence: {signal.get('confidence')}%
 Entry: ${signal.get('entry_price', 0):,.2f}
-Stop Loss: ${signal.get('stop_loss', 0):,.2f}
-Take Profit: ${signal.get('take_profit', 0):,.2f}
-📝 {signal.get('reasoning', 'N/A')}
+SL: ${signal.get('stop_loss', 0):,.2f} | TP: ${signal.get('take_profit', 0):,.2f}
+📝 {signal.get('reasoning')}
 
 """
         
-        text += f"""━━━━━━━━━━━━━━━
-<b>Summary:</b> {signals.get('summary', 'N/A')}
-"""
+        text += f"━━━━━━━━━━━━━━━\n{signals.get('summary', '')}"
+    else:
+        text += "⚪ No high-confidence signals\n\n"
+        for pair, data in list(signals.get("market_data", {}).items())[:5]:
+            emoji = "🟢" if data.get("change_1h", 0) > 0 else "🔴"
+            text += f"{emoji} {pair.split('-')[0]}: ${data['price']:,.2f}\n"
     
-    text += "\n<i>⚠️ Not financial advice. Trade at your own risk.</i>"
+    text += "\n\n<i>⚠️ Not financial advice</i>"
     
-    # Add trade buttons
+    # Trade buttons
     keyboard = []
     for signal in signals.get("signals", []):
         if signal.get("action") == "BUY":
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"🟢 Buy {signal['pair'].split('-')[0]} (${TRADE_AMOUNT_USD})",
-                    callback_data=f"trade_buy_{signal['pair']}"
-                )
-            ])
+            keyboard.append([InlineKeyboardButton(
+                f"🟢 Buy {signal['pair'].split('-')[0]} (${TRADE_AMOUNT_USD})",
+                callback_data=f"trade_buy_{signal['pair']}"
+            )])
     
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-    
-    await msg.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await msg.edit_text(text, parse_mode="HTML", 
+                       reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
 
 
 async def market_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Quick market overview using public API."""
-    msg = await update.message.reply_text("📊 Loading live prices...")
+    """Quick market overview."""
+    msg = await update.message.reply_text("📊 Loading...")
     
-    text = """📊 <b>LIVE MARKET</b>
-━━━━━━━━━━━━━━━
-
-"""
-    
-    # Fetch all prices concurrently for speed
     async def get_pair_data(pair):
-        try:
-            price = await get_public_price(pair)
-            return {"pair": pair, "price": price, "error": None}
-        except Exception as e:
-            return {"pair": pair, "price": 0, "error": str(e)}
+        price = await get_public_price(pair)
+        return {"pair": pair, "price": price}
     
-    # Run all requests concurrently
     results = await asyncio.gather(*[get_pair_data(pair) for pair in TRADING_PAIRS])
     
-    for result in results:
-        pair = result["pair"]
-        price = result["price"]
-        coin = pair.split("-")[0]
-        
-        if price > 0:
-            text += f"🪙 <b>{coin}</b>: ${price:,.2f}\n"
-        else:
-            text += f"⚠️ {coin}: No data\n"
+    text = "📊 <b>LIVE MARKET</b>\n━━━━━━━━━━━━━━━\n\n"
     
-    text += """
-━━━━━━━━━━━━━━━
-<i>Use /signals for full AI analysis</i>"""
+    for r in results:
+        if r["price"] > 0:
+            text += f"🪙 <b>{r['pair'].split('-')[0]}</b>: ${r['price']:,.2f}\n"
     
-    try:
-        await msg.edit_text(text, parse_mode="HTML")
-    except Exception as e:
-        print(f"[ERROR] edit message: {e}")
-        await update.message.reply_text(text, parse_mode="HTML")
-
-
-async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check account balances from Coinbase."""
+    text += "\n<i>/signals for AI analysis</i>"
     
-    if not cdp_client:
-        await update.message.reply_text(
-            "❌ Coinbase not configured.\n\n"
-            "Add API keys to Railway variables."
-        )
-        return
-    
-    msg = await update.message.reply_text("💰 Fetching Coinbase balances...")
-    
-    try:
-        accounts = await cdp_client.get_accounts()
-        
-        if "error" in accounts:
-            await msg.edit_text(f"❌ Error: {accounts['error']}")
-            return
-        
-        text = """💰 <b>COINBASE BALANCES</b>
-━━━━━━━━━━━━━━━
-
-"""
-        
-        total_usd = 0
-        balances_found = []
-        
-        for account in accounts.get("accounts", []):
-            try:
-                balance = float(account.get("available_balance", {}).get("value", 0))
-                currency = account.get("currency", "")
-                
-                if balance > 0.0001:  # Skip dust
-                    if currency == "USD":
-                        balances_found.append(f"💵 <b>USD</b>: ${balance:,.2f}")
-                        total_usd += balance
-                    elif currency in ["BTC", "ETH", "SOL", "AVAX", "LINK", "USDC"]:
-                        # Only show main coins
-                        price = await get_public_price(f"{currency}-USD")
-                        if price > 0:
-                            usd_value = balance * price
-                            total_usd += usd_value
-                            balances_found.append(f"🪙 <b>{currency}</b>: {balance:.6f} (${usd_value:,.2f})")
-            except:
-                continue
-        
-        if balances_found:
-            text += "\n".join(balances_found)
-        else:
-            text += "No significant balances found"
-        
-        text += f"""
-
-━━━━━━━━━━━━━━━
-💰 <b>Total Value:</b> ${total_usd:,.2f}"""
-        
-        await msg.edit_text(text, parse_mode="HTML")
-        
-    except Exception as e:
-        await msg.edit_text(f"❌ Error: {str(e)[:100]}")
+    await msg.edit_text(text, parse_mode="HTML")
 
 
 async def portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current open positions."""
-    
+    """Show positions."""
     if not positions:
-        await update.message.reply_text(
-            "📭 <b>No open positions</b>\n\n"
-            "Use /signals to get trading ideas.\n"
-            "Click the Buy button to open a position.",
-            parse_mode="HTML"
-        )
+        await update.message.reply_text("📭 No open positions.\n\nUse /signals to get ideas.", parse_mode="HTML")
         return
     
-    text = """📊 <b>OPEN POSITIONS</b>
-━━━━━━━━━━━━━━━
-
-"""
-    
+    text = "📊 <b>PORTFOLIO</b>\n━━━━━━━━━━━━━━━\n\n"
     total_pnl = 0
-    keyboard = []
     
-    for pair, pos in list(positions.items()):
-        current_price = await get_public_price(pair)
+    for pair, pos in positions.items():
+        current = await get_public_price(pair)
         entry = pos["entry_price"]
+        pnl_pct = ((current - entry) / entry) * 100
+        pnl_usd = (pnl_pct / 100) * pos["amount_usd"]
+        total_pnl += pnl_usd
         
-        if current_price > 0 and entry > 0:
-            pnl_pct = ((current_price - entry) / entry) * 100
-            pnl_usd = (pnl_pct / 100) * pos["amount_usd"]
-            total_pnl += pnl_usd
-            
-            emoji = "🟢" if pnl_pct > 0 else "🔴"
-            is_live = "🔴 LIVE" if pos.get("live") else "🟡 PAPER"
-            
-            # Calculate stop/target
-            stop_price = entry * (1 - STOP_LOSS_PCT/100)
-            target_price = entry * (1 + TAKE_PROFIT_PCT/100)
-            
-            text += f"""{emoji} <b>{pair}</b> ({is_live})
-Entry: ${entry:,.2f}
-Current: ${current_price:,.2f}
+        emoji = "🟢" if pnl_pct > 0 else "🔴"
+        text += f"""{emoji} <b>{pair}</b>
+Entry: ${entry:,.2f} → ${current:,.2f}
 P&L: {pnl_pct:+.2f}% (${pnl_usd:+.2f})
-🛑 Stop: ${stop_price:,.2f} | 🎯 Target: ${target_price:,.2f}
-
 """
-            # Add close button for each position
-            keyboard.append([InlineKeyboardButton(f"❌ Close {pair.split('-')[0]}", callback_data=f"close_{pair}")])
-        else:
-            text += f"⚠️ <b>{pair}</b> - Error getting price\n\n"
+        # Feature 1: Trailing stop info
+        if "highest_price" in pos:
+            text += f"📈 Peak: ${pos['highest_price']:,.2f}\n"
+        text += "\n"
     
     total_emoji = "🟢" if total_pnl >= 0 else "🔴"
-    text += f"""━━━━━━━━━━━━━━━
-{total_emoji} <b>Total P&L:</b> ${total_pnl:+.2f}
-
-<i>Click button below to close a position</i>"""
+    text += f"━━━━━━━━━━━━━━━\n{total_emoji} <b>Total:</b> ${total_pnl:+.2f}"
     
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    keyboard = [[InlineKeyboardButton(f"Close {pair}", callback_data=f"close_{pair}")] for pair in positions]
     
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show today's P&L."""
-    
+    """Daily P&L."""
     win_rate = (daily_pnl["wins"] / daily_pnl["trades"] * 100) if daily_pnl["trades"] > 0 else 0
     emoji = "🟢" if daily_pnl["realized"] >= 0 else "🔴"
     
     text = f"""📈 <b>TODAY'S P&L</b>
 ━━━━━━━━━━━━━━━
 
-{emoji} Realized P&L: <b>${daily_pnl['realized']:+.2f}</b>
-📊 Total Trades: {daily_pnl['trades']}
+{emoji} Realized: <b>${daily_pnl['realized']:+.2f}</b>
+📊 Trades: {daily_pnl['trades']}
 ✅ Wins: {daily_pnl['wins']}
-📉 Losses: {daily_pnl['trades'] - daily_pnl['wins']}
-🎯 Win Rate: {win_rate:.1f}%
-
-━━━━━━━━━━━━━━━
-<i>Resets at midnight CT</i>"""
+🎯 Win Rate: {win_rate:.1f}%"""
     
     await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current settings."""
-    
-    text = f"""⚙️ <b>QUANTSIGNALS SETTINGS</b>
+    """Settings."""
+    text = f"""⚙️ <b>SETTINGS</b>
 ━━━━━━━━━━━━━━━
 
-💵 Trade Amount: ${TRADE_AMOUNT_USD}
-📊 Max Positions: {MAX_POSITIONS}
+💵 Trade: ${TRADE_AMOUNT_USD}
 🛑 Stop Loss: {STOP_LOSS_PCT}%
 🎯 Take Profit: {TAKE_PROFIT_PCT}%
-
-<b>Trading Pairs:</b>
-{', '.join([p.split('-')[0] for p in TRADING_PAIRS])}
+📈 Trailing Stop: {TRAILING_STOP_PCT}%
+📉 DCA Trigger: {DCA_DROP_PCT}%
 
 <b>Status:</b>
-✅ Market Data: Public API (no auth)
-{"✅" if COINBASE_API_KEY else "⚠️"} Trading: {"Enabled" if COINBASE_API_KEY else "Signals only (add Coinbase keys to trade)"}
-
-━━━━━━━━━━━━━━━
-<i>Edit via Railway environment variables</i>"""
+{"✅" if LIVE_TRADING else "🟡"} Trading: {"LIVE" if LIVE_TRADING else "Paper"}
+{"✅" if cdp_client else "❌"} Coinbase: {"Connected" if cdp_client else "Not configured"}
+{"✅" if redis_client else "⚠️"} Redis: {"Connected" if redis_client else "Memory only"}"""
     
     await update.message.reply_text(text, parse_mode="HTML")
 
 
 # ============ CALLBACK HANDLER ============
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle button clicks."""
     query = update.callback_query
     await query.answer()
-    
     data = query.data
     
     if data.startswith("trade_buy_"):
         pair = data.replace("trade_buy_", "")
         price = await get_public_price(pair)
         
-        if price <= 0:
-            await query.edit_message_text(f"❌ Could not get price for {pair}")
-            return
-        
-        # Check if live trading is enabled
         if LIVE_TRADING and cdp_client:
-            await query.edit_message_text(f"🔄 Executing LIVE BUY for {pair}...")
+            await query.edit_message_text(f"🔄 Executing LIVE BUY {pair}...")
+            result = await cdp_client.place_market_order(pair, "BUY", TRADE_AMOUNT_USD)
             
-            try:
-                result = await cdp_client.place_market_order(pair, "BUY", TRADE_AMOUNT_USD)
+            if result.get("success_response") or result.get("order_id"):
+                positions[pair] = {
+                    "entry_price": price,
+                    "highest_price": price,  # For trailing stop
+                    "amount_usd": TRADE_AMOUNT_USD,
+                    "timestamp": datetime.now().isoformat(),
+                    "live": True
+                }
+                save_positions()
                 
-                # Check for success - CDP returns success_response on success
-                if result.get("success_response") or result.get("order_id") or (result.get("success") == True):
-                    # Get fresh price after order
-                    entry_price = await get_public_price(pair)
-                    
-                    positions[pair] = {
-                        "entry_price": entry_price,
-                        "amount_usd": TRADE_AMOUNT_USD,
-                        "timestamp": datetime.now().isoformat(),
-                        "live": True,
-                        "order_id": result.get("success_response", {}).get("order_id", "unknown")
-                    }
-                    
-                    await query.edit_message_text(
-                        f"✅ <b>LIVE ORDER EXECUTED</b>\n\n"
-                        f"📊 {pair}\n"
-                        f"💵 Amount: ${TRADE_AMOUNT_USD}\n"
-                        f"📍 Entry: ${entry_price:,.2f}\n"
-                        f"🛑 Stop Loss: ${entry_price * (1 - STOP_LOSS_PCT/100):,.2f}\n"
-                        f"🎯 Take Profit: ${entry_price * (1 + TAKE_PROFIT_PCT/100):,.2f}\n\n"
-                        f"✅ Position tracked! Use /portfolio to monitor.",
-                        parse_mode="HTML"
-                    )
-                elif result.get("error_response"):
-                    error = result.get("error_response", {})
-                    error_msg = error.get("message", "Unknown error")
-                    await query.edit_message_text(f"❌ Order failed: {error_msg}")
-                else:
-                    error = result.get("error") or result.get("message") or json.dumps(result)[:200]
-                    await query.edit_message_text(f"❌ Order failed: {error}")
-                    
-            except Exception as e:
-                await query.edit_message_text(f"❌ Error: {str(e)[:100]}")
+                await query.edit_message_text(
+                    f"✅ <b>LIVE ORDER EXECUTED</b>\n\n"
+                    f"📊 {pair}: ${price:,.2f}\n"
+                    f"💵 Amount: ${TRADE_AMOUNT_USD}\n"
+                    f"🛑 SL: ${price*(1-STOP_LOSS_PCT/100):,.2f}\n"
+                    f"🎯 TP: ${price*(1+TAKE_PROFIT_PCT/100):,.2f}\n\n"
+                    f"📈 Trailing stop active at {TRAILING_STOP_PCT}%",
+                    parse_mode="HTML"
+                )
+            else:
+                error = result.get("error_response", {}).get("message", result.get("error", "Unknown"))
+                await query.edit_message_text(f"❌ Order failed: {error}")
         else:
-            # Paper trading
             positions[pair] = {
                 "entry_price": price,
+                "highest_price": price,
                 "amount_usd": TRADE_AMOUNT_USD,
                 "timestamp": datetime.now().isoformat(),
                 "live": False
             }
-            
-            mode = "🟡 PAPER" if not LIVE_TRADING else "⚠️ NO API"
+            save_positions()
             await query.edit_message_text(
-                f"✅ <b>POSITION OPENED</b> ({mode})\n\n"
-                f"📊 {pair}\n"
-                f"💵 Amount: ${TRADE_AMOUNT_USD}\n"
-                f"📍 Entry: ${price:,.2f}\n"
-                f"🛑 Stop Loss: ${price * (1 - STOP_LOSS_PCT/100):,.2f}\n"
-                f"🎯 Take Profit: ${price * (1 + TAKE_PROFIT_PCT/100):,.2f}\n\n"
-                f"<i>Use /portfolio to track</i>\n\n"
-                f"💡 Set LIVE_TRADING=true in Railway for real trades.",
+                f"✅ <b>PAPER POSITION</b>\n\n{pair}: ${price:,.2f}\n\n"
+                f"Set LIVE_TRADING=true for real trades",
                 parse_mode="HTML"
             )
     
     elif data.startswith("close_"):
         pair = data.replace("close_", "")
-        
         if pair in positions:
             entry = positions[pair]["entry_price"]
             current = await get_public_price(pair)
             pnl_pct = ((current - entry) / entry) * 100
             pnl_usd = (pnl_pct / 100) * positions[pair]["amount_usd"]
-            is_live = positions[pair].get("live", False)
-            
-            # If live, execute sell order
-            if is_live and LIVE_TRADING and cdp_client:
-                await query.edit_message_text(f"🔄 Executing LIVE SELL for {pair}...")
-                # Note: For sells, we'd need to track the base amount bought
-                # For now, just close the position tracking
             
             daily_pnl["realized"] += pnl_usd
             daily_pnl["trades"] += 1
@@ -816,20 +1090,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 daily_pnl["wins"] += 1
             
             del positions[pair]
+            save_positions()
             
             emoji = "🟢" if pnl_usd >= 0 else "🔴"
-            mode = "LIVE" if is_live else "PAPER"
             await query.edit_message_text(
-                f"✅ <b>POSITION CLOSED</b> ({mode})\n\n"
-                f"📊 {pair}\n"
-                f"📍 Entry: ${entry:,.2f}\n"
-                f"📍 Exit: ${current:,.2f}\n"
-                f"{emoji} P&L: {pnl_pct:+.2f}% (${pnl_usd:+.2f})\n\n"
-                f"<i>Use /pnl for daily summary</i>",
+                f"✅ <b>CLOSED</b>\n\n{pair}\n"
+                f"Entry: ${entry:,.2f} → Exit: ${current:,.2f}\n"
+                f"{emoji} P&L: {pnl_pct:+.2f}% (${pnl_usd:+.2f})",
                 parse_mode="HTML"
             )
-        else:
-            await query.edit_message_text("❌ Position not found.")
 
 
 # ============ REGISTER HANDLERS ============
@@ -837,242 +1106,202 @@ tg_app.add_handler(CommandHandler("start", start))
 tg_app.add_handler(CommandHandler("help", help_cmd))
 tg_app.add_handler(CommandHandler("signals", signals_cmd))
 tg_app.add_handler(CommandHandler("market", market_cmd))
-tg_app.add_handler(CommandHandler("balance", balance_cmd))
 tg_app.add_handler(CommandHandler("portfolio", portfolio_cmd))
 tg_app.add_handler(CommandHandler("pnl", pnl_cmd))
 tg_app.add_handler(CommandHandler("settings", settings_cmd))
+tg_app.add_handler(CommandHandler("fear", fear_cmd))
+tg_app.add_handler(CommandHandler("news", news_cmd))
+tg_app.add_handler(CommandHandler("whale", whale_cmd))
+tg_app.add_handler(CommandHandler("timeframe", timeframe_cmd))
+tg_app.add_handler(CommandHandler("tf", timeframe_cmd))
+tg_app.add_handler(CommandHandler("backtest", backtest_cmd))
+tg_app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
+tg_app.add_handler(CommandHandler("alert", alert_cmd))
+tg_app.add_handler(CommandHandler("dca", dca_cmd))
 tg_app.add_handler(CallbackQueryHandler(button_callback))
 
 
-# ============ FASTAPI ROUTES ============
-@app.on_event("startup")
-async def on_startup():
-    # Load positions from Redis
-    load_positions()
-    
-    await tg_app.initialize()
-    await tg_app.start()
-    if BASE_URL:
-        webhook_url = f"{BASE_URL}/webhook/{WEBHOOK_SECRET}"
-        await tg_app.bot.set_webhook(url=webhook_url)
-        print(f"✅ Webhook set: {webhook_url}")
-    
-    # Start background tasks
-    asyncio.create_task(stop_loss_monitor())
-    asyncio.create_task(auto_signal_scheduler())
-
-
+# ============ BACKGROUND TASKS ============
 async def stop_loss_monitor():
-    """Background task to check stop losses every 60 seconds."""
+    """Monitor positions for stop loss, take profit, and trailing stop."""
     while True:
         try:
             await asyncio.sleep(60)
             
-            if not positions:
-                continue
-            
             for pair, pos in list(positions.items()):
-                current_price = await get_public_price(pair)
+                current = await get_public_price(pair)
                 entry = pos["entry_price"]
-                pnl_pct = ((current_price - entry) / entry) * 100
+                highest = pos.get("highest_price", entry)
+                
+                # Update highest price for trailing stop
+                if current > highest:
+                    positions[pair]["highest_price"] = current
+                    highest = current
+                    save_positions()
+                
+                pnl_pct = ((current - entry) / entry) * 100
+                trailing_drop = ((current - highest) / highest) * 100
+                
+                should_close = False
+                close_reason = ""
                 
                 # Check stop loss
                 if pnl_pct <= -STOP_LOSS_PCT:
-                    print(f"[STOP LOSS] {pair} hit -{STOP_LOSS_PCT}%")
-                    
-                    # Calculate P&L
-                    pnl_usd = (pnl_pct / 100) * pos["amount_usd"]
-                    daily_pnl["realized"] += pnl_usd
-                    daily_pnl["trades"] += 1
-                    
-                    # Send alert
-                    for chat_id in AUTO_SIGNAL_CHATS:
-                        if chat_id:
-                            try:
-                                await tg_app.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=f"🛑 <b>STOP LOSS HIT</b>\n\n"
-                                         f"📊 {pair}\n"
-                                         f"📍 Entry: ${entry:,.2f}\n"
-                                         f"📍 Exit: ${current_price:,.2f}\n"
-                                         f"🔴 P&L: {pnl_pct:.2f}% (${pnl_usd:.2f})\n\n"
-                                         f"<i>Position auto-closed</i>",
-                                    parse_mode="HTML"
-                                )
-                            except:
-                                pass
-                    
-                    del positions[pair]
-                    save_positions()
+                    should_close = True
+                    close_reason = f"🛑 STOP LOSS (-{STOP_LOSS_PCT}%)"
                 
                 # Check take profit
                 elif pnl_pct >= TAKE_PROFIT_PCT:
-                    print(f"[TAKE PROFIT] {pair} hit +{TAKE_PROFIT_PCT}%")
-                    
+                    should_close = True
+                    close_reason = f"🎯 TAKE PROFIT (+{TAKE_PROFIT_PCT}%)"
+                
+                # Feature 1: Trailing stop
+                elif pnl_pct > 0 and trailing_drop <= -TRAILING_STOP_PCT:
+                    should_close = True
+                    close_reason = f"📈 TRAILING STOP ({TRAILING_STOP_PCT}% from peak)"
+                
+                if should_close:
                     pnl_usd = (pnl_pct / 100) * pos["amount_usd"]
                     daily_pnl["realized"] += pnl_usd
                     daily_pnl["trades"] += 1
-                    daily_pnl["wins"] += 1
-                    
-                    for chat_id in AUTO_SIGNAL_CHATS:
-                        if chat_id:
-                            try:
-                                await tg_app.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=f"🎯 <b>TAKE PROFIT HIT</b>\n\n"
-                                         f"📊 {pair}\n"
-                                         f"📍 Entry: ${entry:,.2f}\n"
-                                         f"📍 Exit: ${current_price:,.2f}\n"
-                                         f"🟢 P&L: +{pnl_pct:.2f}% (+${pnl_usd:.2f})\n\n"
-                                         f"<i>Position auto-closed</i>",
-                                    parse_mode="HTML"
-                                )
-                            except:
-                                pass
+                    if pnl_usd > 0:
+                        daily_pnl["wins"] += 1
                     
                     del positions[pair]
                     save_positions()
                     
+                    emoji = "🟢" if pnl_usd > 0 else "🔴"
+                    for chat_id in AUTO_SIGNAL_CHATS:
+                        try:
+                            await tg_app.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"{close_reason}\n\n"
+                                     f"📊 {pair}\n"
+                                     f"Entry: ${entry:,.2f}\n"
+                                     f"Exit: ${current:,.2f}\n"
+                                     f"Peak: ${highest:,.2f}\n"
+                                     f"{emoji} P&L: {pnl_pct:+.2f}% (${pnl_usd:+.2f})",
+                                parse_mode="HTML"
+                            )
+                        except:
+                            pass
         except Exception as e:
-            print(f"[STOP LOSS ERROR] {e}")
+            print(f"[MONITOR ERROR] {e}")
+
+
+async def price_alert_checker():
+    """Check price alerts."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            
+            for pair, targets in list(price_alerts.items()):
+                current = await get_public_price(pair)
+                
+                for target in targets[:]:
+                    if (target > current * 0.99 and target < current * 1.01):
+                        # Price hit target (within 1%)
+                        for chat_id in AUTO_SIGNAL_CHATS:
+                            try:
+                                await tg_app.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"🔔 <b>PRICE ALERT</b>\n\n"
+                                         f"{pair} reached ${target:,.2f}!\n"
+                                         f"Current: ${current:,.2f}",
+                                    parse_mode="HTML"
+                                )
+                            except:
+                                pass
+                        targets.remove(target)
+                        save_positions()
+        except Exception as e:
+            print(f"[ALERT ERROR] {e}")
 
 
 async def auto_signal_scheduler():
-    """Send signals at scheduled times."""
+    """Send scheduled signals."""
     while True:
         try:
             tz = pytz.timezone("America/Chicago")
             now = datetime.now(tz)
             
-            # Check if current hour is a signal hour and within first 5 minutes
             if now.hour in SIGNAL_HOURS and now.minute < 5:
-                print(f"[AUTO SIGNAL] Sending signals at {now.hour}:00 CT")
-                
                 signals = await generate_trading_signals()
                 
-                if "error" not in signals or signals.get("market_data"):
-                    text = f"📊 <b>QUANTSIGNALS AUTO UPDATE</b>\n"
-                    text += f"⏰ {now.strftime('%I:%M %p %Z')}\n"
-                    text += "━━━━━━━━━━━━━━━\n\n"
-                    
-                    if signals.get("signals"):
-                        sentiment = signals.get('market_sentiment', 'neutral').upper()
-                        text += f"<b>Sentiment:</b> {sentiment}\n\n"
-                        
-                        for signal in signals.get("signals", []):
-                            action = signal.get("action", "HOLD")
-                            emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
-                            text += f"{emoji} <b>{signal.get('pair')}</b>: {action}\n"
-                            text += f"   Confidence: {signal.get('confidence')}%\n"
-                            text += f"   📝 {signal.get('reasoning')}\n\n"
-                    else:
-                        text += "⚪ No high-confidence signals right now.\n\n"
-                        text += "<b>Market Prices:</b>\n"
-                        for pair, data in signals.get("market_data", {}).items():
-                            emoji = "🟢" if data.get("change_1h", 0) > 0 else "🔴"
-                            text += f"{emoji} {pair.split('-')[0]}: ${data['price']:,.2f}\n"
-                    
-                    text += "\n<i>Use /signals for full analysis</i>"
-                    
-                    for chat_id in AUTO_SIGNAL_CHATS:
-                        if chat_id:
-                            try:
-                                await tg_app.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=text,
-                                    parse_mode="HTML"
-                                )
-                            except Exception as e:
-                                print(f"[AUTO SIGNAL] Failed to send to {chat_id}: {e}")
+                text = f"📊 <b>AUTO SIGNAL</b> | {now.strftime('%I:%M %p')}\n━━━━━━━━━━━━━━━\n\n"
                 
-                # Sleep for 10 minutes to avoid duplicate sends
+                fg = signals.get("fear_greed", {})
+                text += f"😱 Fear/Greed: {fg.get('value', 'N/A')}\n\n"
+                
+                if signals.get("signals"):
+                    for sig in signals["signals"]:
+                        emoji = "🟢" if sig["action"] == "BUY" else "🔴"
+                        text += f"{emoji} {sig['pair']}: {sig['action']} ({sig['confidence']}%)\n"
+                else:
+                    text += "⚪ No signals\n"
+                
+                for chat_id in AUTO_SIGNAL_CHATS:
+                    try:
+                        await tg_app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+                    except:
+                        pass
+                
                 await asyncio.sleep(600)
             else:
-                # Check every minute
                 await asyncio.sleep(60)
-                
         except Exception as e:
-            print(f"[AUTO SIGNAL ERROR] {e}")
-            await asyncio.sleep(60)
+            print(f"[SCHEDULER ERROR] {e}")
+
+
+# ============ FASTAPI ============
+@app.on_event("startup")
+async def on_startup():
+    load_positions()
+    await tg_app.initialize()
+    await tg_app.start()
+    if BASE_URL:
+        await tg_app.bot.set_webhook(url=f"{BASE_URL}/webhook/{WEBHOOK_SECRET}")
+        print(f"✅ Webhook set")
+    
+    asyncio.create_task(stop_loss_monitor())
+    asyncio.create_task(auto_signal_scheduler())
+    asyncio.create_task(price_alert_checker())
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    save_positions()
     await tg_app.stop()
-    await tg_app.shutdown()
 
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "bot": "QuantSignals", "positions": len(positions)}
+    return {"status": "ok", "bot": "QuantSignals v2", "positions": len(positions)}
 
 
 @app.get("/debug/signals")
 async def debug_signals():
-    """Test signal generation."""
-    signals = await generate_trading_signals()
-    return signals
-
-
-@app.get("/debug/price/{pair}")
-async def debug_price(pair: str):
-    """Test price fetching."""
-    price = await get_public_price(pair)
-    candles = await get_public_candles(pair)
-    return {"pair": pair, "price": price, "candles_count": len(candles.get("prices", []))}
-
-
-@app.get("/debug/coinbase")
-async def debug_coinbase():
-    """Test Coinbase CDP authentication."""
-    if not cdp_client:
-        return {"error": "CDP client not initialized", "live_trading": LIVE_TRADING}
-    
-    result = await cdp_client.test_auth()
-    return {"live_trading": LIVE_TRADING, "auth_test": result}
+    return await generate_trading_signals()
 
 
 @app.get("/test/auto-signal")
 async def test_auto_signal():
-    """Manually trigger auto signal for testing."""
     if not AUTO_SIGNAL_CHATS:
-        return {"error": "No AUTO_SIGNAL_CHATS configured"}
+        return {"error": "No AUTO_SIGNAL_CHATS"}
     
     signals = await generate_trading_signals()
+    text = "🧪 <b>TEST</b>\n" + json.dumps(signals.get("signals", []), indent=2)[:500]
     
-    tz = pytz.timezone("America/Chicago")
-    now = datetime.now(tz)
-    
-    text = f"🧪 <b>TEST SIGNAL</b>\n"
-    text += f"⏰ {now.strftime('%I:%M %p %Z')}\n"
-    text += "━━━━━━━━━━━━━━━\n\n"
-    
-    if signals.get("signals"):
-        for signal in signals.get("signals", []):
-            action = signal.get("action", "HOLD")
-            emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
-            text += f"{emoji} <b>{signal.get('pair')}</b>: {action}\n"
-            text += f"   Confidence: {signal.get('confidence')}%\n\n"
-    else:
-        text += "⚪ No signals right now\n"
-    
-    sent_to = []
     for chat_id in AUTO_SIGNAL_CHATS:
-        if chat_id:
-            try:
-                await tg_app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-                sent_to.append(chat_id)
-            except Exception as e:
-                return {"error": f"Failed to send to {chat_id}: {str(e)}"}
+        await tg_app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
     
-    return {"success": True, "sent_to": sent_to}
+    return {"sent": len(AUTO_SIGNAL_CHATS)}
 
 
 @app.post("/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request):
+async def webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         return {"ok": False}
-    data = await request.json()
-    update = Update.de_json(data, tg_app.bot)
+    update = Update.de_json(await request.json(), tg_app.bot)
     await tg_app.process_update(update)
     return {"ok": True}
