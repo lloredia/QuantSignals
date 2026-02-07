@@ -104,6 +104,15 @@ AUTO_SIGNAL_CHATS = os.getenv("AUTO_SIGNAL_CHATS", "").split(",")
 AUTO_SIGNAL_CHATS = [c.strip() for c in AUTO_SIGNAL_CHATS if c.strip()]
 SIGNAL_HOURS = [6, 12, 18]
 
+# Autopilot mode
+autopilot_settings = {
+    "enabled": False,
+    "max_daily_trades": 5,
+    "min_confidence": 75,
+    "trades_today": 0,
+    "last_reset": None
+}
+
 
 # ============ COINBASE CDP CLIENT ============
 class CoinbaseCDPClient:
@@ -1019,10 +1028,120 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 <b>Status:</b>
 {"✅" if LIVE_TRADING else "🟡"} Trading: {"LIVE" if LIVE_TRADING else "Paper"}
+{"🤖" if autopilot_settings["enabled"] else "👤"} Mode: {"AUTOPILOT" if autopilot_settings["enabled"] else "Manual"}
 {"✅" if cdp_client else "❌"} Coinbase: {"Connected" if cdp_client else "Not configured"}
 {"✅" if redis_client else "⚠️"} Redis: {"Connected" if redis_client else "Memory only"}"""
     
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+# ============ AUTOPILOT MODE ============
+async def autopilot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle autopilot mode."""
+    args = context.args
+    
+    if not args:
+        # Show status
+        status = "🟢 ACTIVE" if autopilot_settings["enabled"] else "🔴 OFF"
+        
+        text = f"""🤖 <b>AUTOPILOT MODE</b>
+━━━━━━━━━━━━━━━
+
+Status: {status}
+
+<b>Settings:</b>
+• Max daily trades: {autopilot_settings['max_daily_trades']}
+• Min confidence: {autopilot_settings['min_confidence']}%
+• Trades today: {autopilot_settings['trades_today']}
+
+<b>How it works:</b>
+1. AI scans market every hour
+2. Auto-buys high confidence signals
+3. Auto-manages stop loss & take profit
+4. Alerts sent to group
+
+<b>Commands:</b>
+/autopilot on - Enable
+/autopilot off - Disable
+/autopilot max 10 - Set max daily trades
+/autopilot conf 80 - Set min confidence %
+
+<i>⚠️ Use at your own risk!</i>"""
+        
+        await update.message.reply_text(text, parse_mode="HTML")
+        return
+    
+    cmd = args[0].lower()
+    
+    if cmd == "on":
+        if not LIVE_TRADING:
+            await update.message.reply_text(
+                "⚠️ <b>Warning:</b> LIVE_TRADING is off.\n\n"
+                "Autopilot will run in PAPER mode.\n"
+                "Set LIVE_TRADING=true in Railway for real trades.\n\n"
+                "Enabling autopilot anyway...",
+                parse_mode="HTML"
+            )
+        
+        autopilot_settings["enabled"] = True
+        autopilot_settings["trades_today"] = 0
+        save_data("autopilot", autopilot_settings)
+        
+        await update.message.reply_text(
+            "🤖 <b>AUTOPILOT ENABLED</b>\n\n"
+            f"• Max trades/day: {autopilot_settings['max_daily_trades']}\n"
+            f"• Min confidence: {autopilot_settings['min_confidence']}%\n"
+            f"• Mode: {'LIVE 💰' if LIVE_TRADING else 'PAPER 📝'}\n\n"
+            "Bot will now auto-trade high confidence signals!\n\n"
+            "<i>Use /autopilot off to disable</i>",
+            parse_mode="HTML"
+        )
+    
+    elif cmd == "off":
+        autopilot_settings["enabled"] = False
+        save_data("autopilot", autopilot_settings)
+        
+        await update.message.reply_text(
+            "👤 <b>AUTOPILOT DISABLED</b>\n\n"
+            "Switched to manual mode.\n"
+            "Use /signals to get recommendations.",
+            parse_mode="HTML"
+        )
+    
+    elif cmd == "max" and len(args) > 1:
+        try:
+            max_trades = int(args[1])
+            autopilot_settings["max_daily_trades"] = max(1, min(20, max_trades))
+            save_data("autopilot", autopilot_settings)
+            await update.message.reply_text(f"✅ Max daily trades set to {autopilot_settings['max_daily_trades']}")
+        except:
+            await update.message.reply_text("❌ Invalid number. Use: /autopilot max 10")
+    
+    elif cmd == "conf" and len(args) > 1:
+        try:
+            conf = int(args[1])
+            autopilot_settings["min_confidence"] = max(50, min(95, conf))
+            save_data("autopilot", autopilot_settings)
+            await update.message.reply_text(f"✅ Min confidence set to {autopilot_settings['min_confidence']}%")
+        except:
+            await update.message.reply_text("❌ Invalid number. Use: /autopilot conf 80")
+    
+    else:
+        await update.message.reply_text("❌ Unknown command. Use: /autopilot on/off/max/conf")
+
+
+async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pause all trading."""
+    autopilot_settings["enabled"] = False
+    save_data("autopilot", autopilot_settings)
+    
+    await update.message.reply_text(
+        "⏸️ <b>TRADING PAUSED</b>\n\n"
+        "• Autopilot disabled\n"
+        "• Stop loss still active for open positions\n\n"
+        "Use /autopilot on to resume",
+        parse_mode="HTML"
+    )
 
 
 # ============ CALLBACK HANDLER ============
@@ -1118,6 +1237,8 @@ tg_app.add_handler(CommandHandler("backtest", backtest_cmd))
 tg_app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
 tg_app.add_handler(CommandHandler("alert", alert_cmd))
 tg_app.add_handler(CommandHandler("dca", dca_cmd))
+tg_app.add_handler(CommandHandler("autopilot", autopilot_cmd))
+tg_app.add_handler(CommandHandler("pause", pause_cmd))
 tg_app.add_handler(CallbackQueryHandler(button_callback))
 
 
@@ -1225,6 +1346,12 @@ async def auto_signal_scheduler():
             tz = pytz.timezone("America/Chicago")
             now = datetime.now(tz)
             
+            # Reset daily trade count at midnight
+            if autopilot_settings["last_reset"] != now.date().isoformat():
+                autopilot_settings["trades_today"] = 0
+                autopilot_settings["last_reset"] = now.date().isoformat()
+                save_data("autopilot", autopilot_settings)
+            
             if now.hour in SIGNAL_HOURS and now.minute < 5:
                 signals = await generate_trading_signals()
                 
@@ -1253,6 +1380,112 @@ async def auto_signal_scheduler():
             print(f"[SCHEDULER ERROR] {e}")
 
 
+async def autopilot_scanner():
+    """Autopilot mode - auto-execute trades."""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Check every 5 minutes
+            
+            if not autopilot_settings["enabled"]:
+                continue
+            
+            # Check if we've hit daily limit
+            if autopilot_settings["trades_today"] >= autopilot_settings["max_daily_trades"]:
+                continue
+            
+            # Check if we have too many positions
+            if len(positions) >= MAX_POSITIONS:
+                continue
+            
+            # Generate signals
+            signals = await generate_trading_signals(include_news=False)
+            
+            if not signals.get("signals"):
+                continue
+            
+            for signal in signals["signals"]:
+                # Only process BUY signals with high confidence
+                if signal.get("action") != "BUY":
+                    continue
+                
+                confidence = signal.get("confidence", 0)
+                if confidence < autopilot_settings["min_confidence"]:
+                    continue
+                
+                pair = signal.get("pair")
+                
+                # Skip if already have position in this pair
+                if pair in positions:
+                    continue
+                
+                # Check daily limit again
+                if autopilot_settings["trades_today"] >= autopilot_settings["max_daily_trades"]:
+                    break
+                
+                # Execute trade
+                price = await get_public_price(pair)
+                
+                if LIVE_TRADING and cdp_client:
+                    result = await cdp_client.place_market_order(pair, "BUY", TRADE_AMOUNT_USD)
+                    
+                    if result.get("success_response") or result.get("order_id"):
+                        positions[pair] = {
+                            "entry_price": price,
+                            "highest_price": price,
+                            "amount_usd": TRADE_AMOUNT_USD,
+                            "timestamp": datetime.now().isoformat(),
+                            "live": True,
+                            "autopilot": True
+                        }
+                        autopilot_settings["trades_today"] += 1
+                        save_positions()
+                        save_data("autopilot", autopilot_settings)
+                        
+                        # Alert
+                        for chat_id in AUTO_SIGNAL_CHATS:
+                            try:
+                                await tg_app.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"🤖 <b>AUTOPILOT BUY</b>\n\n"
+                                         f"📊 {pair}\n"
+                                         f"💰 ${TRADE_AMOUNT_USD} @ ${price:,.2f}\n"
+                                         f"🎯 Confidence: {confidence}%\n"
+                                         f"📝 {signal.get('reasoning', '')}\n\n"
+                                         f"Trades today: {autopilot_settings['trades_today']}/{autopilot_settings['max_daily_trades']}",
+                                    parse_mode="HTML"
+                                )
+                            except:
+                                pass
+                else:
+                    # Paper trade
+                    positions[pair] = {
+                        "entry_price": price,
+                        "highest_price": price,
+                        "amount_usd": TRADE_AMOUNT_USD,
+                        "timestamp": datetime.now().isoformat(),
+                        "live": False,
+                        "autopilot": True
+                    }
+                    autopilot_settings["trades_today"] += 1
+                    save_positions()
+                    save_data("autopilot", autopilot_settings)
+                    
+                    for chat_id in AUTO_SIGNAL_CHATS:
+                        try:
+                            await tg_app.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"🤖 <b>AUTOPILOT BUY (PAPER)</b>\n\n"
+                                     f"📊 {pair} @ ${price:,.2f}\n"
+                                     f"🎯 Confidence: {confidence}%",
+                                parse_mode="HTML"
+                            )
+                        except:
+                            pass
+                
+        except Exception as e:
+            print(f"[AUTOPILOT ERROR] {e}")
+
+
 # ============ FASTAPI ============
 @app.on_event("startup")
 async def on_startup():
@@ -1266,6 +1499,7 @@ async def on_startup():
     asyncio.create_task(stop_loss_monitor())
     asyncio.create_task(auto_signal_scheduler())
     asyncio.create_task(price_alert_checker())
+    asyncio.create_task(autopilot_scanner())
 
 
 @app.on_event("shutdown")
