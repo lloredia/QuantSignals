@@ -12,6 +12,44 @@ from openai import OpenAI
 import time
 import secrets
 
+# Optional Redis for persistence
+try:
+    import redis
+    REDIS_URL = os.getenv("REDIS_URL")
+    if REDIS_URL:
+        redis_client = redis.from_url(REDIS_URL)
+        print("✅ Redis connected")
+    else:
+        redis_client = None
+except:
+    redis_client = None
+
+
+def save_positions():
+    """Save positions to Redis."""
+    if redis_client:
+        try:
+            redis_client.set("qs_positions", json.dumps(positions))
+            redis_client.set("qs_daily_pnl", json.dumps(daily_pnl))
+        except Exception as e:
+            print(f"[REDIS] Save error: {e}")
+
+
+def load_positions():
+    """Load positions from Redis."""
+    global positions, daily_pnl
+    if redis_client:
+        try:
+            pos_data = redis_client.get("qs_positions")
+            pnl_data = redis_client.get("qs_daily_pnl")
+            if pos_data:
+                positions = json.loads(pos_data)
+            if pnl_data:
+                daily_pnl = json.loads(pnl_data)
+            print(f"[REDIS] Loaded {len(positions)} positions")
+        except Exception as e:
+            print(f"[REDIS] Load error: {e}")
+
 # ============ CONFIG ============
 TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "quantsignals-secret")
@@ -28,8 +66,11 @@ MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "5"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "10"))
 
-# Supported coins
-TRADING_PAIRS = ["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "LINK-USD"]
+# Supported coins - expanded list
+TRADING_PAIRS = [
+    "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "LINK-USD",
+    "DOGE-USD", "XRP-USD", "ADA-USD", "MATIC-USD", "DOT-USD"
+]
 
 app = FastAPI()
 tg_app = Application.builder().token(TOKEN).build()
@@ -40,6 +81,13 @@ daily_pnl = {"realized": 0.0, "trades": 0, "wins": 0}
 
 # Live trading mode
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
+
+# Auto signal chat IDs (comma separated)
+AUTO_SIGNAL_CHATS = os.getenv("AUTO_SIGNAL_CHATS", "").split(",")
+AUTO_SIGNAL_CHATS = [c.strip() for c in AUTO_SIGNAL_CHATS if c.strip()]
+
+# Scheduled signal times (CT): 6 AM, 12 PM, 6 PM
+SIGNAL_HOURS = [6, 12, 18]
 
 
 # ============ COINBASE CDP CLIENT ============
@@ -799,12 +847,153 @@ tg_app.add_handler(CallbackQueryHandler(button_callback))
 # ============ FASTAPI ROUTES ============
 @app.on_event("startup")
 async def on_startup():
+    # Load positions from Redis
+    load_positions()
+    
     await tg_app.initialize()
     await tg_app.start()
     if BASE_URL:
         webhook_url = f"{BASE_URL}/webhook/{WEBHOOK_SECRET}"
         await tg_app.bot.set_webhook(url=webhook_url)
         print(f"✅ Webhook set: {webhook_url}")
+    
+    # Start background tasks
+    asyncio.create_task(stop_loss_monitor())
+    asyncio.create_task(auto_signal_scheduler())
+
+
+async def stop_loss_monitor():
+    """Background task to check stop losses every 60 seconds."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            
+            if not positions:
+                continue
+            
+            for pair, pos in list(positions.items()):
+                current_price = await get_public_price(pair)
+                entry = pos["entry_price"]
+                pnl_pct = ((current_price - entry) / entry) * 100
+                
+                # Check stop loss
+                if pnl_pct <= -STOP_LOSS_PCT:
+                    print(f"[STOP LOSS] {pair} hit -{STOP_LOSS_PCT}%")
+                    
+                    # Calculate P&L
+                    pnl_usd = (pnl_pct / 100) * pos["amount_usd"]
+                    daily_pnl["realized"] += pnl_usd
+                    daily_pnl["trades"] += 1
+                    
+                    # Send alert
+                    for chat_id in AUTO_SIGNAL_CHATS:
+                        if chat_id:
+                            try:
+                                await tg_app.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"🛑 <b>STOP LOSS HIT</b>\n\n"
+                                         f"📊 {pair}\n"
+                                         f"📍 Entry: ${entry:,.2f}\n"
+                                         f"📍 Exit: ${current_price:,.2f}\n"
+                                         f"🔴 P&L: {pnl_pct:.2f}% (${pnl_usd:.2f})\n\n"
+                                         f"<i>Position auto-closed</i>",
+                                    parse_mode="HTML"
+                                )
+                            except:
+                                pass
+                    
+                    del positions[pair]
+                    save_positions()
+                
+                # Check take profit
+                elif pnl_pct >= TAKE_PROFIT_PCT:
+                    print(f"[TAKE PROFIT] {pair} hit +{TAKE_PROFIT_PCT}%")
+                    
+                    pnl_usd = (pnl_pct / 100) * pos["amount_usd"]
+                    daily_pnl["realized"] += pnl_usd
+                    daily_pnl["trades"] += 1
+                    daily_pnl["wins"] += 1
+                    
+                    for chat_id in AUTO_SIGNAL_CHATS:
+                        if chat_id:
+                            try:
+                                await tg_app.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"🎯 <b>TAKE PROFIT HIT</b>\n\n"
+                                         f"📊 {pair}\n"
+                                         f"📍 Entry: ${entry:,.2f}\n"
+                                         f"📍 Exit: ${current_price:,.2f}\n"
+                                         f"🟢 P&L: +{pnl_pct:.2f}% (+${pnl_usd:.2f})\n\n"
+                                         f"<i>Position auto-closed</i>",
+                                    parse_mode="HTML"
+                                )
+                            except:
+                                pass
+                    
+                    del positions[pair]
+                    save_positions()
+                    
+        except Exception as e:
+            print(f"[STOP LOSS ERROR] {e}")
+
+
+async def auto_signal_scheduler():
+    """Send signals at scheduled times."""
+    while True:
+        try:
+            tz = pytz.timezone("America/Chicago")
+            now = datetime.now(tz)
+            
+            # Check if current hour is a signal hour and within first 5 minutes
+            if now.hour in SIGNAL_HOURS and now.minute < 5:
+                print(f"[AUTO SIGNAL] Sending signals at {now.hour}:00 CT")
+                
+                signals = await generate_trading_signals()
+                
+                if "error" not in signals or signals.get("market_data"):
+                    text = f"📊 <b>QUANTSIGNALS AUTO UPDATE</b>\n"
+                    text += f"⏰ {now.strftime('%I:%M %p %Z')}\n"
+                    text += "━━━━━━━━━━━━━━━\n\n"
+                    
+                    if signals.get("signals"):
+                        sentiment = signals.get('market_sentiment', 'neutral').upper()
+                        text += f"<b>Sentiment:</b> {sentiment}\n\n"
+                        
+                        for signal in signals.get("signals", []):
+                            action = signal.get("action", "HOLD")
+                            emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
+                            text += f"{emoji} <b>{signal.get('pair')}</b>: {action}\n"
+                            text += f"   Confidence: {signal.get('confidence')}%\n"
+                            text += f"   📝 {signal.get('reasoning')}\n\n"
+                    else:
+                        text += "⚪ No high-confidence signals right now.\n\n"
+                        text += "<b>Market Prices:</b>\n"
+                        for pair, data in signals.get("market_data", {}).items():
+                            emoji = "🟢" if data.get("change_1h", 0) > 0 else "🔴"
+                            text += f"{emoji} {pair.split('-')[0]}: ${data['price']:,.2f}\n"
+                    
+                    text += "\n<i>Use /signals for full analysis</i>"
+                    
+                    for chat_id in AUTO_SIGNAL_CHATS:
+                        if chat_id:
+                            try:
+                                await tg_app.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=text,
+                                    parse_mode="HTML"
+                                )
+                            except Exception as e:
+                                print(f"[AUTO SIGNAL] Failed to send to {chat_id}: {e}")
+                
+                # Sleep for 10 minutes to avoid duplicate sends
+                await asyncio.sleep(600)
+            else:
+                # Check every minute
+                await asyncio.sleep(60)
+                
+        except Exception as e:
+            print(f"[AUTO SIGNAL ERROR] {e}")
+            await asyncio.sleep(60)
 
 
 @app.on_event("shutdown")
