@@ -56,6 +56,7 @@ class CoinbaseCDPClient:
     def _build_jwt(self, method: str, path: str) -> str:
         """Build JWT for CDP API."""
         import jwt as pyjwt
+        import secrets as sec
         
         uri = f"{method} api.coinbase.com{path}"
         
@@ -65,19 +66,29 @@ class CoinbaseCDPClient:
             "nbf": int(time.time()),
             "exp": int(time.time()) + 120,
             "uri": uri,
+            "nonce": sec.token_hex(16),
+        }
+        
+        headers = {
+            "kid": self.api_key,
+            "nonce": sec.token_hex(16),
         }
         
         # Load private key
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.backends import default_backend
         
-        private_key = serialization.load_pem_private_key(
-            self.api_secret.encode(),
-            password=None,
-            backend=default_backend()
-        )
+        try:
+            private_key = serialization.load_pem_private_key(
+                self.api_secret.encode(),
+                password=None,
+                backend=default_backend()
+            )
+        except Exception as e:
+            print(f"[CDP] Key load error: {e}")
+            raise
         
-        token = pyjwt.encode(payload, private_key, algorithm="ES256")
+        token = pyjwt.encode(payload, private_key, algorithm="ES256", headers=headers)
         return token
     
     def _headers(self, method: str, path: str) -> dict:
