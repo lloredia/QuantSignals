@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 import pytz
 import httpx
 from fastapi import FastAPI, Request
@@ -75,16 +75,47 @@ COINBASE_API_SECRET = os.getenv("COINBASE_API_SECRET")
 
 # Trading Config
 TRADE_AMOUNT_USD = float(os.getenv("TRADE_AMOUNT_USD", "10"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "5"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "10"))
-TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "3"))  # Feature 1: Trailing Stop
-DCA_DROP_PCT = float(os.getenv("DCA_DROP_PCT", "5"))  # Feature 5: DCA trigger
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "3"))
+DCA_DROP_PCT = float(os.getenv("DCA_DROP_PCT", "5"))
+
+# ============ ULTRA MODE CONFIG ============
+# Risk Management
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "25"))  # Max 25% per position
+MAX_PORTFOLIO_RISK = float(os.getenv("MAX_PORTFOLIO_RISK", "60"))  # Max 60% at risk
+MAX_DAILY_DRAWDOWN = float(os.getenv("MAX_DAILY_DRAWDOWN", "10"))  # Stop if down 10%
+MIN_EXPECTED_VALUE = float(os.getenv("MIN_EXPECTED_VALUE", "1.5"))  # Min 1.5% EV
+
+# Kelly Criterion
+KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))  # Use 25% Kelly for safety
 
 # Expanded coin list
 TRADING_PAIRS = [
     "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "LINK-USD",
-    "DOGE-USD", "XRP-USD", "ADA-USD", "MATIC-USD", "DOT-USD"
+    "DOGE-USD", "XRP-USD", "ADA-USD", "MATIC-USD", "DOT-USD",
+    "ATOM-USD", "UNI-USD", "AAVE-USD", "LTC-USD", "NEAR-USD"
+]
+
+# Strategy Types
+STRATEGY_TYPES = [
+    "momentum_breakout",
+    "mean_reversion", 
+    "volatility_expansion",
+    "trend_following",
+    "liquidity_sweep",
+    "sentiment_anomaly",
+    "cross_asset_correlation"
+]
+
+# Market Regimes
+MARKET_REGIMES = [
+    "bull_high_vol",
+    "bull_low_vol", 
+    "bear_high_vol",
+    "bear_low_vol",
+    "sideways"
 ]
 
 app = FastAPI()
@@ -107,16 +138,53 @@ SIGNAL_HOURS = [6, 12, 18]
 # Autopilot mode
 autopilot_settings = {
     "enabled": False,
-    "max_daily_trades": 5,
-    "min_confidence": 75,
+    "max_daily_trades": 15,
+    "min_confidence": 70,
     "trades_today": 0,
     "last_reset": None,
-    "use_percentage": True,  # Use % of balance instead of fixed amount
-    "trade_percentage": 20,  # Use 20% of available USD per trade
-    "min_trade_usd": 5,      # Minimum trade size
-    "max_trade_usd": 100,    # Maximum trade size
+    "use_percentage": True,
+    "trade_percentage": 20,
+    "min_trade_usd": 5,
+    "max_trade_usd": 500,
     "reinvest_profits": True,
-    "total_profit": 0.0
+    "total_profit": 0.0,
+    # Ultra features
+    "use_kelly": True,
+    "min_expected_value": 1.5,
+    "scan_interval": 60,  # Scan every 60 seconds
+    "daily_target_pct": 3.0,
+    "daily_achieved_pct": 0.0,
+    "current_regime": "unknown",
+    "regime_confidence": 0,
+    "paused": False,
+    "pause_reason": None,
+}
+
+# Strategy Performance Tracking (Self-Learning)
+strategy_performance = {
+    "momentum_breakout": {"trades": 0, "wins": 0, "pnl": 0, "weight": 1.0, "avg_ev": 0},
+    "mean_reversion": {"trades": 0, "wins": 0, "pnl": 0, "weight": 1.0, "avg_ev": 0},
+    "volatility_expansion": {"trades": 0, "wins": 0, "pnl": 0, "weight": 1.0, "avg_ev": 0},
+    "trend_following": {"trades": 0, "wins": 0, "pnl": 0, "weight": 1.0, "avg_ev": 0},
+    "liquidity_sweep": {"trades": 0, "wins": 0, "pnl": 0, "weight": 1.0, "avg_ev": 0},
+    "sentiment_anomaly": {"trades": 0, "wins": 0, "pnl": 0, "weight": 1.0, "avg_ev": 0},
+    "cross_asset_correlation": {"trades": 0, "wins": 0, "pnl": 0, "weight": 1.0, "avg_ev": 0},
+}
+
+# Portfolio Tracking
+portfolio_stats = {
+    "starting_balance": 0,
+    "peak_balance": 0,
+    "current_drawdown": 0,
+    "max_drawdown": 0,
+    "sharpe_ratio": 0,
+    "total_trades": 0,
+    "winning_trades": 0,
+    "losing_trades": 0,
+    "avg_win": 0,
+    "avg_loss": 0,
+    "profit_factor": 0,
+    "daily_returns": [],
 }
 
 
@@ -390,12 +458,190 @@ async def get_multi_timeframe_data(pair: str) -> dict:
     return result
 
 
-# ============ AI SIGNAL GENERATOR (Enhanced) ============
+# ============ ULTRA: MARKET REGIME DETECTION ============
+async def detect_market_regime() -> dict:
+    """Detect current market regime using BTC as market proxy."""
+    try:
+        # Get BTC data for regime detection
+        candles = await get_public_candles("BTC-USD", 3600)  # 1h candles
+        if not candles or not candles.get("prices"):
+            return {"regime": "unknown", "confidence": 0}
+        
+        prices = candles["prices"]
+        
+        # Calculate metrics
+        sma_20 = sum(prices[:20]) / 20 if len(prices) >= 20 else prices[0]
+        sma_50 = sum(prices[:50]) / 50 if len(prices) >= 50 else prices[0]
+        current = prices[0]
+        
+        # Volatility (standard deviation)
+        if len(prices) >= 20:
+            mean = sum(prices[:20]) / 20
+            variance = sum((p - mean) ** 2 for p in prices[:20]) / 20
+            volatility = (variance ** 0.5) / mean * 100
+        else:
+            volatility = 2
+        
+        # Trend direction
+        trend_bullish = current > sma_20 > sma_50
+        trend_bearish = current < sma_20 < sma_50
+        
+        # High/low volatility threshold
+        high_vol = volatility > 3
+        
+        # Determine regime
+        if trend_bullish and high_vol:
+            regime = "bull_high_vol"
+            regime_display = "🐂📈 Bull + High Volatility"
+        elif trend_bullish and not high_vol:
+            regime = "bull_low_vol"
+            regime_display = "🐂📊 Bull + Low Volatility"
+        elif trend_bearish and high_vol:
+            regime = "bear_high_vol"
+            regime_display = "🐻📉 Bear + High Volatility"
+        elif trend_bearish and not high_vol:
+            regime = "bear_low_vol"
+            regime_display = "🐻📊 Bear + Low Volatility"
+        else:
+            regime = "sideways"
+            regime_display = "↔️ Sideways/Ranging"
+        
+        # Confidence based on trend strength
+        trend_strength = abs(current - sma_50) / sma_50 * 100
+        confidence = min(95, max(50, 50 + trend_strength * 5))
+        
+        return {
+            "regime": regime,
+            "regime_display": regime_display,
+            "confidence": round(confidence),
+            "volatility": round(volatility, 2),
+            "trend_strength": round(trend_strength, 2),
+            "sma_20": round(sma_20, 2),
+            "sma_50": round(sma_50, 2)
+        }
+    except Exception as e:
+        print(f"[REGIME] Error: {e}")
+        return {"regime": "unknown", "confidence": 0}
+
+
+# ============ ULTRA: KELLY CRITERION POSITION SIZING ============
+def calculate_kelly_position(win_rate: float, avg_win: float, avg_loss: float, 
+                             balance: float, confidence: float) -> float:
+    """Calculate optimal position size using Kelly Criterion."""
+    if win_rate <= 0 or avg_loss <= 0:
+        return balance * 0.05  # Default 5%
+    
+    # Kelly formula: f = (bp - q) / b
+    # where b = avg_win/avg_loss, p = win_rate, q = 1-p
+    b = avg_win / avg_loss if avg_loss > 0 else 1
+    p = win_rate / 100
+    q = 1 - p
+    
+    kelly = (b * p - q) / b if b > 0 else 0
+    
+    # Apply Kelly fraction for safety (typically 25% of full Kelly)
+    kelly_adjusted = kelly * KELLY_FRACTION
+    
+    # Adjust by confidence
+    confidence_factor = confidence / 100
+    kelly_adjusted *= confidence_factor
+    
+    # Cap at max position size
+    kelly_adjusted = max(0.01, min(kelly_adjusted, MAX_POSITION_PCT / 100))
+    
+    position_size = balance * kelly_adjusted
+    
+    return round(position_size, 2)
+
+
+# ============ ULTRA: CALCULATE EXPECTED VALUE ============
+def calculate_expected_value(confidence: float, take_profit: float, stop_loss: float) -> float:
+    """Calculate expected value of a trade."""
+    win_rate = confidence / 100
+    loss_rate = 1 - win_rate
+    
+    ev = (win_rate * take_profit) - (loss_rate * stop_loss)
+    return round(ev, 2)
+
+
+# ============ ULTRA: UPDATE STRATEGY WEIGHTS (Self-Learning) ============
+def update_strategy_weights():
+    """Update strategy weights based on performance."""
+    global strategy_performance
+    
+    total_trades = sum(s["trades"] for s in strategy_performance.values())
+    if total_trades < 10:
+        return  # Need more data
+    
+    for strategy, stats in strategy_performance.items():
+        if stats["trades"] >= 3:
+            win_rate = stats["wins"] / stats["trades"] if stats["trades"] > 0 else 0
+            pnl_factor = 1 + (stats["pnl"] / 100) if stats["pnl"] != 0 else 1
+            
+            # Weight = win_rate * pnl_factor, normalized
+            new_weight = win_rate * pnl_factor
+            
+            # Smooth update (80% old, 20% new)
+            stats["weight"] = stats["weight"] * 0.8 + new_weight * 0.2
+            
+            # Disable underperforming strategies (weight < 0.3)
+            if stats["weight"] < 0.3 and stats["trades"] >= 10:
+                stats["weight"] = 0.1  # Heavily reduce but don't completely disable
+            
+            # Cap weights
+            stats["weight"] = max(0.1, min(2.0, stats["weight"]))
+    
+    save_data("strategy_performance", strategy_performance)
+
+
+# ============ ULTRA: CHECK RISK LIMITS ============
+async def check_risk_limits() -> Tuple[bool, str]:
+    """Check if we can trade based on risk limits."""
+    global autopilot_settings, portfolio_stats
+    
+    # Check daily drawdown
+    if cdp_client:
+        current_balance = await cdp_client.get_usd_balance()
+        if portfolio_stats.get("starting_balance", 0) > 0:
+            daily_pnl_pct = ((current_balance - portfolio_stats["starting_balance"]) / 
+                           portfolio_stats["starting_balance"]) * 100
+            if daily_pnl_pct <= -MAX_DAILY_DRAWDOWN:
+                return False, f"Daily drawdown limit hit ({daily_pnl_pct:.1f}%)"
+    
+    # Check max trades per day
+    if autopilot_settings["trades_today"] >= autopilot_settings["max_daily_trades"]:
+        return False, "Max daily trades reached"
+    
+    # Check max positions
+    if len(positions) >= MAX_POSITIONS:
+        return False, "Max positions reached"
+    
+    # Check portfolio risk
+    total_at_risk = sum(p.get("amount_usd", 0) for p in positions.values())
+    if cdp_client:
+        balance = await cdp_client.get_usd_balance()
+        if balance > 0:
+            risk_pct = (total_at_risk / balance) * 100
+            if risk_pct >= MAX_PORTFOLIO_RISK:
+                return False, f"Portfolio risk limit ({risk_pct:.1f}%)"
+    
+    return True, "OK"
+
+
+# ============ AI SIGNAL GENERATOR (Enhanced Ultra) ============
 async def generate_trading_signals(include_news: bool = True) -> dict:
     """Generate AI trading signals with enhanced data."""
     
     if not OPENAI_API_KEY:
         return {"error": "OpenAI not configured"}
+    
+    # Get market regime
+    regime = await detect_market_regime()
+    autopilot_settings["current_regime"] = regime.get("regime", "unknown")
+    autopilot_settings["regime_confidence"] = regime.get("confidence", 0)
+    
+    # Get strategy weights for prompt
+    active_strategies = {k: v for k, v in strategy_performance.items() if v["weight"] >= 0.3}
     
     # Gather market data
     market_data = {}
@@ -410,6 +656,27 @@ async def generate_trading_signals(include_news: bool = True) -> dict:
                 sma_21 = sum(prices[:21]) / 21 if len(prices) >= 21 else price
                 change_1h = ((prices[0] - prices[1]) / prices[1]) * 100 if len(prices) >= 2 else 0
                 
+                # Calculate volatility
+                if len(prices) >= 20:
+                    mean = sum(prices[:20]) / 20
+                    variance = sum((p - mean) ** 2 for p in prices[:20]) / 20
+                    volatility = (variance ** 0.5) / mean * 100
+                else:
+                    volatility = 0
+                
+                # RSI calculation (simplified)
+                gains = losses = 0
+                for i in range(1, min(15, len(prices))):
+                    diff = prices[i-1] - prices[i]
+                    if diff > 0:
+                        gains += diff
+                    else:
+                        losses -= diff
+                avg_gain = gains / 14 if gains else 0.001
+                avg_loss = losses / 14 if losses else 0.001
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+                
                 market_data[pair] = {
                     "price": price,
                     "high_24h": candle_data.get("high_24h", price),
@@ -418,6 +685,8 @@ async def generate_trading_signals(include_news: bool = True) -> dict:
                     "sma_8": round(sma_8, 2),
                     "sma_21": round(sma_21, 2),
                     "change_1h": round(change_1h, 2),
+                    "volatility": round(volatility, 2),
+                    "rsi": round(rsi, 1),
                     "trend": "bullish" if sma_8 > sma_21 else "bearish"
                 }
         except Exception as e:
@@ -436,18 +705,29 @@ async def generate_trading_signals(include_news: bool = True) -> dict:
     tz = pytz.timezone("America/Chicago")
     now = datetime.now(tz)
     
-    prompt = f"""You are an expert crypto day trader AI with advanced market analysis.
+    prompt = f"""You are QuantSignals - an elite autonomous quantitative trading AI designed to maximize long-term portfolio growth.
 
 CURRENT TIME: {now.strftime("%Y-%m-%d %H:%M %Z")}
-TRADING STYLE: Day trading (1-8 hours)
-RISK: 5% stop loss, 10% take profit
+TRADING STYLE: Multi-strategy quantitative trading
+
+═══════════════════════════════════════════════════
+MARKET REGIME: {regime.get('regime_display', 'Unknown')}
+Regime Confidence: {regime.get('confidence', 0)}%
+Volatility: {regime.get('volatility', 0)}%
+═══════════════════════════════════════════════════
 
 FEAR & GREED INDEX: {fear_greed['value']} ({fear_greed['classification']})
-- 0-25: Extreme Fear (potential buying opportunity)
-- 25-45: Fear
-- 45-55: Neutral
-- 55-75: Greed
-- 75-100: Extreme Greed (potential selling opportunity)
+- 0-25: Extreme Fear → BUY opportunity
+- 75-100: Extreme Greed → SELL signal
+
+AVAILABLE STRATEGIES (use based on regime):
+1. MOMENTUM_BREAKOUT - Best in: bull_high_vol, bull_low_vol
+2. MEAN_REVERSION - Best in: sideways, bear_low_vol
+3. VOLATILITY_EXPANSION - Best in: high volatility regimes
+4. TREND_FOLLOWING - Best in: bull_low_vol, bear_low_vol
+5. LIQUIDITY_SWEEP - Best in: high volatility after consolidation
+6. SENTIMENT_ANOMALY - When fear/greed is extreme
+7. CROSS_ASSET_CORRELATION - When BTC leads altcoin moves
 
 LIVE MARKET DATA:
 """
@@ -455,9 +735,11 @@ LIVE MARKET DATA:
     for pair, data in market_data.items():
         prompt += f"""
 {pair}: ${data['price']:,.2f}
-- 24h: High ${data['high_24h']:,.2f} / Low ${data['low_24h']:,.2f}
+- 24h Range: ${data['low_24h']:,.2f} - ${data['high_24h']:,.2f}
 - 1h Change: {data['change_1h']:+.2f}%
-- SMA8: ${data['sma_8']:,.2f} / SMA21: ${data['sma_21']:,.2f}
+- Volatility: {data.get('volatility', 0):.1f}%
+- RSI(14): {data.get('rsi', 50):.0f}
+- SMA8/SMA21: ${data['sma_8']:,.2f} / ${data['sma_21']:,.2f}
 - Trend: {data['trend'].upper()}
 """
     
@@ -469,31 +751,59 @@ LIVE MARKET DATA:
     
     prompt += """
 
-ANALYSIS RULES:
-1. Consider Fear & Greed - buy on fear, cautious on greed
-2. Look for trend confirmations (SMA crossovers)
-3. News sentiment affects short-term moves
-4. Only HIGH confidence (>70%) trades
-5. Max 2 signals
+═══════════════════════════════════════════════════
+QUANTITATIVE ANALYSIS RULES:
+═══════════════════════════════════════════════════
 
-OUTPUT (JSON only):
+1. REGIME-BASED STRATEGY SELECTION:
+   - Bull + High Vol → Momentum breakouts, trend following
+   - Bull + Low Vol → Trend following, mean reversion at support
+   - Bear + High Vol → Short momentum, volatility plays
+   - Bear + Low Vol → Mean reversion, wait for reversal
+   - Sideways → Mean reversion, range trading
+
+2. ENTRY CRITERIA (ALL must be met):
+   - Confidence > 70%
+   - Expected Value > 1.5%
+   - Risk/Reward > 2:1
+   - Aligned with current regime
+
+3. POSITION SIZING:
+   - Calculate based on stop distance and risk tolerance
+   - Scale position with confidence level
+
+4. MULTI-TARGET EXITS:
+   - TP1: Conservative (scale out 40%)
+   - TP2: Standard (scale out 40%)  
+   - TP3: Extended (let 20% run)
+
+OUTPUT FORMAT (JSON only, no markdown):
 {
+    "regime_analysis": "Current regime assessment",
     "signals": [
         {
             "pair": "BTC-USD",
-            "action": "BUY",
-            "confidence": 78,
+            "direction": "BUY",
+            "confidence": 82,
+            "expected_value": 3.2,
+            "risk_level": "MEDIUM",
+            "strategy": "momentum_breakout",
             "entry_price": 97000,
-            "stop_loss": 92150,
-            "take_profit": 106700,
-            "timeframe": "4h",
-            "reasoning": "Brief reason"
+            "stop_loss": 94090,
+            "take_profit_1": 99910,
+            "take_profit_2": 102820,
+            "take_profit_3": 106700,
+            "position_size_pct": 15,
+            "reasoning": "SMA8 crossed above SMA21, volume confirming breakout, RSI not overbought"
         }
     ],
     "market_sentiment": "bullish",
-    "fear_greed_analysis": "Fear indicates buying opportunity",
-    "summary": "One sentence summary"
+    "regime": "bull_high_vol",
+    "summary": "Brief market summary"
 }
+
+PRIORITY: Capital preservation → Consistency → Compounding
+Maximum 3 high-quality signals. If no good setups, return empty signals array.
 """
     
     try:
@@ -501,11 +811,11 @@ OUTPUT (JSON only):
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "Expert crypto trader. JSON only, no markdown."},
+                {"role": "system", "content": "You are QuantSignals, an elite quantitative trading AI. Output valid JSON only, no markdown code blocks."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=1000,
-            temperature=0.7
+            max_tokens=1500,
+            temperature=0.5
         )
         
         result_text = response.choices[0].message.content.strip()
@@ -518,24 +828,39 @@ OUTPUT (JSON only):
         signals = json.loads(result_text)
         signals["market_data"] = market_data
         signals["fear_greed"] = fear_greed
+        signals["regime_data"] = regime
         signals["generated_at"] = now.isoformat()
         
-        # Track signals for leaderboard (Feature 7)
+        # Calculate EV for each signal and track
         for sig in signals.get("signals", []):
+            # Calculate EV if not provided
+            if "expected_value" not in sig:
+                entry = sig.get("entry_price", 0)
+                sl = sig.get("stop_loss", 0)
+                tp = sig.get("take_profit_1", sig.get("take_profit", 0))
+                if entry and sl and tp:
+                    risk = abs(entry - sl) / entry * 100
+                    reward = abs(tp - entry) / entry * 100
+                    confidence = sig.get("confidence", 70)
+                    sig["expected_value"] = calculate_expected_value(confidence, reward, risk)
+            
+            # Track signal for learning
             signal_history.append({
                 "pair": sig.get("pair"),
-                "action": sig.get("action"),
-                "price": sig.get("entry_price"),
+                "direction": sig.get("direction", sig.get("action")),
+                "strategy": sig.get("strategy", "unknown"),
+                "entry_price": sig.get("entry_price"),
                 "confidence": sig.get("confidence"),
+                "expected_value": sig.get("expected_value", 0),
                 "timestamp": now.isoformat(),
-                "result": None  # Updated later
+                "result": None
             })
-        save_positions()
         
+        save_positions()
         return signals
         
     except Exception as e:
-        return {"error": str(e), "market_data": market_data}
+        return {"error": str(e), "market_data": market_data, "regime_data": regime}
 
 
 # ============ FEATURE 6: BACKTESTING ============
@@ -596,40 +921,171 @@ async def run_backtest(pair: str, days: int = 30) -> dict:
 
 # ============ TELEGRAM COMMANDS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome = """📊 <b>QUANTSIGNALS v2.0</b>
+    welcome = """🚀 <b>QUANTSIGNALS ULTRA</b>
+<i>Elite Quantitative Trading Intelligence</i>
 
-AI-powered crypto trading with advanced features.
+═══════════════════════════════════
 
 <b>📈 Trading:</b>
-/signals - AI trading signals
-/market - Live prices
+/signals - AI quantitative signals
+/market - Live prices + RSI
 /portfolio - Your positions
 /pnl - Daily P&L
 
 <b>📊 Analysis:</b>
+/regime - Market regime detection
 /fear - Fear & Greed Index
 /news - Crypto news
-/whale - Whale alerts
 /timeframe [coin] - Multi-TF analysis
+/whale - Whale alerts
 
-<b>🤖 Automation:</b>
-/autopilot - Full auto-trading mode
-/pause - Pause all trading
-/alert [coin] [price] - Price alerts
+<b>🤖 Ultra Mode:</b>
+/autopilot - Autonomous trading
+/strategies - Strategy performance
+/stats - Portfolio statistics
+/pause - Pause trading
 
 <b>⚙️ Tools:</b>
 /backtest [coin] - Strategy backtest
 /leaderboard - Signal performance
+/alert [coin] [price] - Price alerts
 /dca - DCA opportunities
 /settings - Bot settings
 
-<i>⚠️ Not financial advice. Trade responsibly.</i>"""
+═══════════════════════════════════
+<i>Capital Preservation → Consistency → Compounding</i>"""
     
     await update.message.reply_text(welcome, parse_mode="HTML")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
+
+
+# ============ ULTRA: REGIME COMMAND ============
+async def regime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current market regime analysis."""
+    msg = await update.message.reply_text("🔍 Analyzing market regime...")
+    
+    regime = await detect_market_regime()
+    fg = await get_fear_greed_index()
+    
+    # Strategy recommendations based on regime
+    regime_strategies = {
+        "bull_high_vol": ["⚡ Momentum Breakout", "📈 Trend Following"],
+        "bull_low_vol": ["📈 Trend Following", "🔄 Mean Reversion (support)"],
+        "bear_high_vol": ["💥 Volatility Plays", "🔄 Mean Reversion"],
+        "bear_low_vol": ["🔄 Mean Reversion", "⏳ Wait for reversal"],
+        "sideways": ["🔄 Mean Reversion", "📊 Range Trading"],
+    }
+    
+    rec_strategies = regime_strategies.get(regime.get("regime", ""), ["⏳ Wait for clarity"])
+    
+    text = f"""🔍 <b>MARKET REGIME ANALYSIS</b>
+═══════════════════════════════════
+
+<b>Current Regime:</b>
+{regime.get('regime_display', '❓ Unknown')}
+
+<b>Metrics:</b>
+📊 Confidence: {regime.get('confidence', 0)}%
+📈 Volatility: {regime.get('volatility', 0):.1f}%
+💪 Trend Strength: {regime.get('trend_strength', 0):.1f}%
+📉 SMA20: ${regime.get('sma_20', 0):,.2f}
+📉 SMA50: ${regime.get('sma_50', 0):,.2f}
+
+<b>Fear & Greed:</b> {fg['value']} ({fg['classification']})
+
+═══════════════════════════════════
+<b>Recommended Strategies:</b>
+"""
+    for strat in rec_strategies:
+        text += f"• {strat}\n"
+    
+    text += """
+═══════════════════════════════════
+<i>Regime updated every scan cycle</i>"""
+    
+    await msg.edit_text(text, parse_mode="HTML")
+
+
+# ============ ULTRA: STRATEGIES COMMAND ============
+async def strategies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show strategy performance (self-learning stats)."""
+    
+    text = """📊 <b>STRATEGY PERFORMANCE</b>
+<i>Self-Learning Weights</i>
+═══════════════════════════════════
+
+"""
+    
+    # Sort by weight
+    sorted_strats = sorted(strategy_performance.items(), key=lambda x: x[1]["weight"], reverse=True)
+    
+    for strat, stats in sorted_strats:
+        win_rate = (stats["wins"] / stats["trades"] * 100) if stats["trades"] > 0 else 0
+        weight_bar = "█" * int(stats["weight"] * 5) + "░" * (5 - int(stats["weight"] * 5))
+        
+        status = "✅" if stats["weight"] >= 0.7 else "⚠️" if stats["weight"] >= 0.3 else "❌"
+        
+        strat_display = strat.replace("_", " ").title()
+        text += f"""{status} <b>{strat_display}</b>
+   Weight: [{weight_bar}] {stats['weight']:.2f}
+   Trades: {stats['trades']} | Wins: {stats['wins']} ({win_rate:.0f}%)
+   P&L: ${stats['pnl']:+.2f}
+
+"""
+    
+    text += """═══════════════════════════════════
+<i>Weights auto-adjust based on performance</i>"""
+    
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+# ============ ULTRA: STATS COMMAND ============
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show portfolio statistics."""
+    
+    # Get current balance
+    usd_balance = 0
+    if cdp_client:
+        usd_balance = await cdp_client.get_usd_balance()
+    
+    total_trades = portfolio_stats.get("total_trades", 0) + daily_pnl.get("trades", 0)
+    winning_trades = portfolio_stats.get("winning_trades", 0) + daily_pnl.get("wins", 0)
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+    
+    total_pnl = autopilot_settings.get("total_profit", 0) + daily_pnl.get("realized", 0)
+    
+    text = f"""📈 <b>PORTFOLIO STATISTICS</b>
+═══════════════════════════════════
+
+<b>💰 Account:</b>
+Balance: ${usd_balance:,.2f}
+Open Positions: {len(positions)}
+
+<b>📊 Performance:</b>
+Total Trades: {total_trades}
+Win Rate: {win_rate:.1f}%
+Total P&L: ${total_pnl:+,.2f}
+
+<b>📅 Today:</b>
+Trades: {daily_pnl.get('trades', 0)}
+P&L: ${daily_pnl.get('realized', 0):+,.2f}
+Target: {autopilot_settings.get('daily_target_pct', 2)}%
+
+<b>🎯 Risk Metrics:</b>
+Max Position: {MAX_POSITION_PCT}%
+Max Portfolio Risk: {MAX_PORTFOLIO_RISK}%
+Max Daily Drawdown: {MAX_DAILY_DRAWDOWN}%
+
+<b>🤖 Autopilot:</b>
+Status: {'🟢 Active' if autopilot_settings['enabled'] else '🔴 Off'}
+Regime: {autopilot_settings.get('current_regime', 'unknown')}
+
+═══════════════════════════════════"""
+    
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 # Feature 3: Fear & Greed
@@ -1374,6 +1830,9 @@ tg_app.add_handler(CommandHandler("alert", alert_cmd))
 tg_app.add_handler(CommandHandler("dca", dca_cmd))
 tg_app.add_handler(CommandHandler("autopilot", autopilot_cmd))
 tg_app.add_handler(CommandHandler("pause", pause_cmd))
+tg_app.add_handler(CommandHandler("regime", regime_cmd))
+tg_app.add_handler(CommandHandler("strategies", strategies_cmd))
+tg_app.add_handler(CommandHandler("stats", stats_cmd))
 tg_app.add_handler(CallbackQueryHandler(button_callback))
 
 
@@ -1523,33 +1982,29 @@ async def auto_signal_scheduler():
 
 
 async def autopilot_scanner():
-    """Autopilot mode - auto-execute trades with dynamic sizing."""
+    """Autopilot mode - auto-execute trades with Ultra intelligence."""
     while True:
         try:
-            await asyncio.sleep(300)  # Check every 5 minutes
+            scan_interval = autopilot_settings.get("scan_interval", 60)
+            await asyncio.sleep(scan_interval)
             
             if not autopilot_settings["enabled"]:
                 continue
             
-            # Check if we've hit daily limit
-            if autopilot_settings["trades_today"] >= autopilot_settings["max_daily_trades"]:
+            if autopilot_settings.get("paused"):
                 continue
             
-            # Check if we have too many positions
-            if len(positions) >= MAX_POSITIONS:
+            # Check risk limits
+            can_trade, reason = await check_risk_limits()
+            if not can_trade:
+                print(f"[AUTOPILOT] Blocked: {reason}")
                 continue
             
-            # Get current USD balance for dynamic sizing
-            usd_balance = TRADE_AMOUNT_USD  # Default fallback
+            # Get current USD balance
+            usd_balance = TRADE_AMOUNT_USD
             if cdp_client and LIVE_TRADING:
                 usd_balance = await cdp_client.get_usd_balance()
             
-            # Calculate trade size based on percentage of balance
-            trade_amount = usd_balance * autopilot_settings["trade_percentage"] / 100
-            trade_amount = max(autopilot_settings["min_trade_usd"], 
-                             min(autopilot_settings["max_trade_usd"], trade_amount))
-            
-            # Skip if not enough balance
             if usd_balance < autopilot_settings["min_trade_usd"]:
                 continue
             
@@ -1560,31 +2015,51 @@ async def autopilot_scanner():
                 continue
             
             for signal in signals["signals"]:
-                # Only process BUY signals with high confidence
-                if signal.get("action") != "BUY":
+                # Get direction (support both old and new format)
+                direction = signal.get("direction", signal.get("action", "")).upper()
+                if direction != "BUY":
                     continue
                 
                 confidence = signal.get("confidence", 0)
+                expected_value = signal.get("expected_value", 0)
+                strategy = signal.get("strategy", "unknown")
+                
+                # Check confidence threshold
                 if confidence < autopilot_settings["min_confidence"]:
                     continue
                 
-                pair = signal.get("pair")
+                # Check expected value threshold
+                min_ev = autopilot_settings.get("min_expected_value", MIN_EXPECTED_VALUE)
+                if expected_value < min_ev:
+                    continue
                 
-                # Skip if already have position in this pair
+                # Check strategy weight
+                strat_weight = strategy_performance.get(strategy, {}).get("weight", 1.0)
+                if strat_weight < 0.3:
+                    print(f"[AUTOPILOT] Skipping {strategy} - low weight ({strat_weight})")
+                    continue
+                
+                pair = signal.get("pair")
                 if pair in positions:
                     continue
                 
-                # Check daily limit again
-                if autopilot_settings["trades_today"] >= autopilot_settings["max_daily_trades"]:
-                    break
+                # Calculate position size
+                if autopilot_settings.get("use_kelly") and strategy in strategy_performance:
+                    stats = strategy_performance[strategy]
+                    win_rate = (stats["wins"] / stats["trades"] * 100) if stats["trades"] > 3 else 55
+                    avg_win = TAKE_PROFIT_PCT
+                    avg_loss = STOP_LOSS_PCT
+                    trade_amount = calculate_kelly_position(win_rate, avg_win, avg_loss, usd_balance, confidence)
+                else:
+                    trade_amount = usd_balance * autopilot_settings["trade_percentage"] / 100
                 
-                # Re-check balance for this specific trade
+                # Apply limits
+                trade_amount = max(autopilot_settings["min_trade_usd"],
+                                 min(autopilot_settings["max_trade_usd"], trade_amount))
+                
+                # Verify balance
                 if cdp_client and LIVE_TRADING:
                     usd_balance = await cdp_client.get_usd_balance()
-                    trade_amount = usd_balance * autopilot_settings["trade_percentage"] / 100
-                    trade_amount = max(autopilot_settings["min_trade_usd"], 
-                                     min(autopilot_settings["max_trade_usd"], trade_amount))
-                    
                     if usd_balance < trade_amount:
                         continue
                 
