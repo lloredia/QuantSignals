@@ -110,7 +110,13 @@ autopilot_settings = {
     "max_daily_trades": 5,
     "min_confidence": 75,
     "trades_today": 0,
-    "last_reset": None
+    "last_reset": None,
+    "use_percentage": True,  # Use % of balance instead of fixed amount
+    "trade_percentage": 20,  # Use 20% of available USD per trade
+    "min_trade_usd": 5,      # Minimum trade size
+    "max_trade_usd": 100,    # Maximum trade size
+    "reinvest_profits": True,
+    "total_profit": 0.0
 }
 
 
@@ -182,6 +188,17 @@ class CoinbaseCDPClient:
                 return {"status": resp.status_code, "body": resp.text[:500]}
         except Exception as e:
             return {"error": str(e)}
+    
+    async def get_usd_balance(self) -> float:
+        """Get available USD balance."""
+        try:
+            accounts = await self.get_accounts()
+            for account in accounts.get("accounts", []):
+                if account.get("currency") == "USD":
+                    return float(account.get("available_balance", {}).get("value", 0))
+        except Exception as e:
+            print(f"[CDP] Balance error: {e}")
+        return 0.0
 
 
 # Initialize CDP client
@@ -1045,32 +1062,49 @@ async def autopilot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     
     if not args:
-        # Show status
+        # Get current USD balance
+        usd_balance = 0
+        if cdp_client:
+            usd_balance = await cdp_client.get_usd_balance()
+        
         status = "🟢 ACTIVE" if autopilot_settings["enabled"] else "🔴 OFF"
         
         text = f"""🤖 <b>AUTOPILOT MODE</b>
 ━━━━━━━━━━━━━━━
 
 Status: {status}
+💰 USD Balance: <b>${usd_balance:,.2f}</b>
 
-<b>Settings:</b>
+<b>Trade Settings:</b>
+• Trade size: {autopilot_settings['trade_percentage']}% of balance
+• Min trade: ${autopilot_settings['min_trade_usd']}
+• Max trade: ${autopilot_settings['max_trade_usd']}
+• Reinvest profits: {'✅ Yes' if autopilot_settings['reinvest_profits'] else '❌ No'}
+
+<b>Limits:</b>
 • Max daily trades: {autopilot_settings['max_daily_trades']}
 • Min confidence: {autopilot_settings['min_confidence']}%
 • Trades today: {autopilot_settings['trades_today']}
 
+<b>Performance:</b>
+• Total profit: ${autopilot_settings['total_profit']:+,.2f}
+
 <b>How it works:</b>
-1. AI scans market every hour
-2. Auto-buys high confidence signals
-3. Auto-manages stop loss & take profit
-4. Alerts sent to group
+1. Uses {autopilot_settings['trade_percentage']}% of your USD balance per trade
+2. Auto-buys signals with {autopilot_settings['min_confidence']}%+ confidence
+3. Profits are reinvested for compounding
+4. Stop loss & trailing stop protect positions
 
 <b>Commands:</b>
 /autopilot on - Enable
 /autopilot off - Disable
-/autopilot max 10 - Set max daily trades
-/autopilot conf 80 - Set min confidence %
+/autopilot max 10 - Max daily trades
+/autopilot conf 80 - Min confidence %
+/autopilot pct 25 - Trade % of balance
+/autopilot minusd 10 - Min trade $
+/autopilot maxusd 200 - Max trade $
 
-<i>⚠️ Use at your own risk!</i>"""
+<i>⚠️ Trades real money when LIVE_TRADING=true</i>"""
         
         await update.message.reply_text(text, parse_mode="HTML")
         return
@@ -1078,26 +1112,40 @@ Status: {status}
     cmd = args[0].lower()
     
     if cmd == "on":
-        if not LIVE_TRADING:
+        # Check balance first
+        usd_balance = 0
+        if cdp_client:
+            usd_balance = await cdp_client.get_usd_balance()
+        
+        if LIVE_TRADING and usd_balance < autopilot_settings['min_trade_usd']:
             await update.message.reply_text(
-                "⚠️ <b>Warning:</b> LIVE_TRADING is off.\n\n"
-                "Autopilot will run in PAPER mode.\n"
-                "Set LIVE_TRADING=true in Railway for real trades.\n\n"
-                "Enabling autopilot anyway...",
+                f"⚠️ <b>Low Balance</b>\n\n"
+                f"USD Balance: ${usd_balance:,.2f}\n"
+                f"Min trade size: ${autopilot_settings['min_trade_usd']}\n\n"
+                f"Add funds to Coinbase or lower min with:\n"
+                f"/autopilot minusd 5",
                 parse_mode="HTML"
             )
+            return
         
         autopilot_settings["enabled"] = True
         autopilot_settings["trades_today"] = 0
         save_data("autopilot", autopilot_settings)
         
+        trade_size = min(
+            autopilot_settings['max_trade_usd'],
+            max(autopilot_settings['min_trade_usd'], usd_balance * autopilot_settings['trade_percentage'] / 100)
+        )
+        
         await update.message.reply_text(
-            "🤖 <b>AUTOPILOT ENABLED</b>\n\n"
-            f"• Max trades/day: {autopilot_settings['max_daily_trades']}\n"
-            f"• Min confidence: {autopilot_settings['min_confidence']}%\n"
-            f"• Mode: {'LIVE 💰' if LIVE_TRADING else 'PAPER 📝'}\n\n"
-            "Bot will now auto-trade high confidence signals!\n\n"
-            "<i>Use /autopilot off to disable</i>",
+            f"🤖 <b>AUTOPILOT ENABLED</b>\n\n"
+            f"💰 USD Balance: ${usd_balance:,.2f}\n"
+            f"📊 Trade size: ~${trade_size:,.2f} ({autopilot_settings['trade_percentage']}%)\n"
+            f"🎯 Min confidence: {autopilot_settings['min_confidence']}%\n"
+            f"📈 Max trades/day: {autopilot_settings['max_daily_trades']}\n"
+            f"♻️ Reinvest profits: {'Yes' if autopilot_settings['reinvest_profits'] else 'No'}\n\n"
+            f"Mode: {'💰 LIVE' if LIVE_TRADING else '📝 PAPER'}\n\n"
+            f"<i>Bot will auto-trade high confidence signals!</i>",
             parse_mode="HTML"
         )
     
@@ -1106,32 +1154,62 @@ Status: {status}
         save_data("autopilot", autopilot_settings)
         
         await update.message.reply_text(
-            "👤 <b>AUTOPILOT DISABLED</b>\n\n"
-            "Switched to manual mode.\n"
-            "Use /signals to get recommendations.",
+            f"👤 <b>AUTOPILOT DISABLED</b>\n\n"
+            f"Total profit this session: ${autopilot_settings['total_profit']:+,.2f}\n\n"
+            f"Use /signals for manual trading.",
             parse_mode="HTML"
         )
     
     elif cmd == "max" and len(args) > 1:
         try:
             max_trades = int(args[1])
-            autopilot_settings["max_daily_trades"] = max(1, min(20, max_trades))
+            autopilot_settings["max_daily_trades"] = max(1, min(50, max_trades))
             save_data("autopilot", autopilot_settings)
-            await update.message.reply_text(f"✅ Max daily trades set to {autopilot_settings['max_daily_trades']}")
+            await update.message.reply_text(f"✅ Max daily trades: {autopilot_settings['max_daily_trades']}")
         except:
-            await update.message.reply_text("❌ Invalid number. Use: /autopilot max 10")
+            await update.message.reply_text("❌ Invalid. Use: /autopilot max 10")
     
     elif cmd == "conf" and len(args) > 1:
         try:
             conf = int(args[1])
             autopilot_settings["min_confidence"] = max(50, min(95, conf))
             save_data("autopilot", autopilot_settings)
-            await update.message.reply_text(f"✅ Min confidence set to {autopilot_settings['min_confidence']}%")
+            await update.message.reply_text(f"✅ Min confidence: {autopilot_settings['min_confidence']}%")
         except:
-            await update.message.reply_text("❌ Invalid number. Use: /autopilot conf 80")
+            await update.message.reply_text("❌ Invalid. Use: /autopilot conf 80")
+    
+    elif cmd == "pct" and len(args) > 1:
+        try:
+            pct = int(args[1])
+            autopilot_settings["trade_percentage"] = max(5, min(50, pct))
+            save_data("autopilot", autopilot_settings)
+            await update.message.reply_text(f"✅ Trade percentage: {autopilot_settings['trade_percentage']}% of balance")
+        except:
+            await update.message.reply_text("❌ Invalid. Use: /autopilot pct 25")
+    
+    elif cmd == "minusd" and len(args) > 1:
+        try:
+            min_usd = float(args[1])
+            autopilot_settings["min_trade_usd"] = max(1, min(100, min_usd))
+            save_data("autopilot", autopilot_settings)
+            await update.message.reply_text(f"✅ Min trade: ${autopilot_settings['min_trade_usd']}")
+        except:
+            await update.message.reply_text("❌ Invalid. Use: /autopilot minusd 10")
+    
+    elif cmd == "maxusd" and len(args) > 1:
+        try:
+            max_usd = float(args[1])
+            autopilot_settings["max_trade_usd"] = max(10, min(1000, max_usd))
+            save_data("autopilot", autopilot_settings)
+            await update.message.reply_text(f"✅ Max trade: ${autopilot_settings['max_trade_usd']}")
+        except:
+            await update.message.reply_text("❌ Invalid. Use: /autopilot maxusd 200")
     
     else:
-        await update.message.reply_text("❌ Unknown command. Use: /autopilot on/off/max/conf")
+        await update.message.reply_text(
+            "❌ Unknown command.\n\n"
+            "Use: /autopilot on/off/max/conf/pct/minusd/maxusd"
+        )
 
 
 async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1292,20 +1370,27 @@ async def stop_loss_monitor():
                     if pnl_usd > 0:
                         daily_pnl["wins"] += 1
                     
+                    # Track autopilot profits for reinvestment
+                    if pos.get("autopilot"):
+                        autopilot_settings["total_profit"] += pnl_usd
+                        save_data("autopilot", autopilot_settings)
+                    
                     del positions[pair]
                     save_positions()
                     
                     emoji = "🟢" if pnl_usd > 0 else "🔴"
+                    auto_tag = " 🤖" if pos.get("autopilot") else ""
                     for chat_id in AUTO_SIGNAL_CHATS:
                         try:
                             await tg_app.bot.send_message(
                                 chat_id=chat_id,
-                                text=f"{close_reason}\n\n"
+                                text=f"{close_reason}{auto_tag}\n\n"
                                      f"📊 {pair}\n"
                                      f"Entry: ${entry:,.2f}\n"
                                      f"Exit: ${current:,.2f}\n"
                                      f"Peak: ${highest:,.2f}\n"
-                                     f"{emoji} P&L: {pnl_pct:+.2f}% (${pnl_usd:+.2f})",
+                                     f"{emoji} P&L: {pnl_pct:+.2f}% (${pnl_usd:+.2f})\n\n"
+                                     f"💰 Total autopilot profit: ${autopilot_settings['total_profit']:+,.2f}",
                                 parse_mode="HTML"
                             )
                         except:
@@ -1385,7 +1470,7 @@ async def auto_signal_scheduler():
 
 
 async def autopilot_scanner():
-    """Autopilot mode - auto-execute trades."""
+    """Autopilot mode - auto-execute trades with dynamic sizing."""
     while True:
         try:
             await asyncio.sleep(300)  # Check every 5 minutes
@@ -1399,6 +1484,20 @@ async def autopilot_scanner():
             
             # Check if we have too many positions
             if len(positions) >= MAX_POSITIONS:
+                continue
+            
+            # Get current USD balance for dynamic sizing
+            usd_balance = TRADE_AMOUNT_USD  # Default fallback
+            if cdp_client and LIVE_TRADING:
+                usd_balance = await cdp_client.get_usd_balance()
+            
+            # Calculate trade size based on percentage of balance
+            trade_amount = usd_balance * autopilot_settings["trade_percentage"] / 100
+            trade_amount = max(autopilot_settings["min_trade_usd"], 
+                             min(autopilot_settings["max_trade_usd"], trade_amount))
+            
+            # Skip if not enough balance
+            if usd_balance < autopilot_settings["min_trade_usd"]:
                 continue
             
             # Generate signals
@@ -1426,17 +1525,27 @@ async def autopilot_scanner():
                 if autopilot_settings["trades_today"] >= autopilot_settings["max_daily_trades"]:
                     break
                 
+                # Re-check balance for this specific trade
+                if cdp_client and LIVE_TRADING:
+                    usd_balance = await cdp_client.get_usd_balance()
+                    trade_amount = usd_balance * autopilot_settings["trade_percentage"] / 100
+                    trade_amount = max(autopilot_settings["min_trade_usd"], 
+                                     min(autopilot_settings["max_trade_usd"], trade_amount))
+                    
+                    if usd_balance < trade_amount:
+                        continue
+                
                 # Execute trade
                 price = await get_public_price(pair)
                 
                 if LIVE_TRADING and cdp_client:
-                    result = await cdp_client.place_market_order(pair, "BUY", TRADE_AMOUNT_USD)
+                    result = await cdp_client.place_market_order(pair, "BUY", trade_amount)
                     
                     if result.get("success_response") or result.get("order_id"):
                         positions[pair] = {
                             "entry_price": price,
                             "highest_price": price,
-                            "amount_usd": TRADE_AMOUNT_USD,
+                            "amount_usd": trade_amount,
                             "timestamp": datetime.now().isoformat(),
                             "live": True,
                             "autopilot": True
@@ -1452,10 +1561,11 @@ async def autopilot_scanner():
                                     chat_id=chat_id,
                                     text=f"🤖 <b>AUTOPILOT BUY</b>\n\n"
                                          f"📊 {pair}\n"
-                                         f"💰 ${TRADE_AMOUNT_USD} @ ${price:,.2f}\n"
+                                         f"💰 ${trade_amount:,.2f} @ ${price:,.2f}\n"
+                                         f"💵 Balance: ${usd_balance:,.2f}\n"
                                          f"🎯 Confidence: {confidence}%\n"
                                          f"📝 {signal.get('reasoning', '')}\n\n"
-                                         f"Trades today: {autopilot_settings['trades_today']}/{autopilot_settings['max_daily_trades']}",
+                                         f"Trades: {autopilot_settings['trades_today']}/{autopilot_settings['max_daily_trades']}",
                                     parse_mode="HTML"
                                 )
                             except:
@@ -1465,7 +1575,7 @@ async def autopilot_scanner():
                     positions[pair] = {
                         "entry_price": price,
                         "highest_price": price,
-                        "amount_usd": TRADE_AMOUNT_USD,
+                        "amount_usd": trade_amount,
                         "timestamp": datetime.now().isoformat(),
                         "live": False,
                         "autopilot": True
@@ -1480,6 +1590,7 @@ async def autopilot_scanner():
                                 chat_id=chat_id,
                                 text=f"🤖 <b>AUTOPILOT BUY (PAPER)</b>\n\n"
                                      f"📊 {pair} @ ${price:,.2f}\n"
+                                     f"💰 ${trade_amount:,.2f}\n"
                                      f"🎯 Confidence: {confidence}%",
                                 parse_mode="HTML"
                             )
