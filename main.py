@@ -1032,6 +1032,42 @@ async def debug_coinbase():
     return {"live_trading": LIVE_TRADING, "auth_test": result}
 
 
+@app.get("/test/auto-signal")
+async def test_auto_signal():
+    """Manually trigger auto signal for testing."""
+    if not AUTO_SIGNAL_CHATS:
+        return {"error": "No AUTO_SIGNAL_CHATS configured"}
+    
+    signals = await generate_trading_signals()
+    
+    tz = pytz.timezone("America/Chicago")
+    now = datetime.now(tz)
+    
+    text = f"🧪 <b>TEST SIGNAL</b>\n"
+    text += f"⏰ {now.strftime('%I:%M %p %Z')}\n"
+    text += "━━━━━━━━━━━━━━━\n\n"
+    
+    if signals.get("signals"):
+        for signal in signals.get("signals", []):
+            action = signal.get("action", "HOLD")
+            emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
+            text += f"{emoji} <b>{signal.get('pair')}</b>: {action}\n"
+            text += f"   Confidence: {signal.get('confidence')}%\n\n"
+    else:
+        text += "⚪ No signals right now\n"
+    
+    sent_to = []
+    for chat_id in AUTO_SIGNAL_CHATS:
+        if chat_id:
+            try:
+                await tg_app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+                sent_to.append(chat_id)
+            except Exception as e:
+                return {"error": f"Failed to send to {chat_id}: {str(e)}"}
+    
+    return {"success": True, "sent_to": sent_to}
+
+
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
