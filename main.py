@@ -1019,6 +1019,43 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Interactive menu with buttons."""
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 Signals", callback_data="menu_signals"),
+            InlineKeyboardButton("💼 Portfolio", callback_data="menu_portfolio")
+        ],
+        [
+            InlineKeyboardButton("💰 Buy", callback_data="menu_buy"),
+            InlineKeyboardButton("💸 Sell", callback_data="menu_sell")
+        ],
+        [
+            InlineKeyboardButton("📈 Market", callback_data="menu_market"),
+            InlineKeyboardButton("😱 Fear/Greed", callback_data="menu_fear")
+        ],
+        [
+            InlineKeyboardButton("🔍 Regime", callback_data="menu_regime"),
+            InlineKeyboardButton("📰 News", callback_data="menu_news")
+        ],
+        [
+            InlineKeyboardButton("🤖 Autopilot", callback_data="menu_autopilot"),
+            InlineKeyboardButton("📊 Performance", callback_data="menu_performance")
+        ],
+        [
+            InlineKeyboardButton("📜 History", callback_data="menu_history"),
+            InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")
+        ]
+    ]
+    
+    await update.message.reply_text(
+        "🚀 <b>QUANTSIGNALS ULTRA</b>\n\n"
+        "Select an option:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
 # ============ ULTRA: REGIME COMMAND ============
 async def regime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current market regime analysis."""
@@ -2267,7 +2304,191 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     
-    if data == "refresh_portfolio":
+    # Menu button handlers
+    if data == "menu_signals":
+        await query.edit_message_text("🔄 Generating signals...")
+        signals = await generate_trading_signals(include_news=False)
+        text = "📊 <b>AI SIGNALS</b>\n━━━━━━━━━━━━━━━\n\n"
+        if signals.get("signals"):
+            for sig in signals["signals"][:3]:
+                direction = sig.get("direction", sig.get("action", "HOLD"))
+                emoji = "🟢" if direction == "BUY" else "🔴"
+                text += f"{emoji} <b>{sig.get('pair')}</b>: {direction} ({sig.get('confidence')}%)\n"
+                text += f"   Entry: ${sig.get('entry_price', 0):,.2f}\n"
+                text += f"   EV: {sig.get('expected_value', 0):.1f}%\n\n"
+        else:
+            text += "⚪ No high-confidence signals\n"
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="menu_signals"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_portfolio":
+        await query.edit_message_text("📊 Loading portfolio...")
+        holdings = {"usd_balance": 0, "crypto_value": 0, "total_value": 0, "assets": []}
+        if cdp_client:
+            holdings = await cdp_client.get_all_holdings()
+        text = f"💼 <b>PORTFOLIO</b>\n━━━━━━━━━━━━━━━\n\n"
+        text += f"💰 Total: <b>${holdings['total_value']:,.2f}</b>\n"
+        text += f"💵 USD: ${holdings['usd_balance']:,.2f}\n"
+        text += f"🪙 Crypto: ${holdings['crypto_value']:,.2f}\n\n"
+        for asset in holdings["assets"][:5]:
+            text += f"• <b>{asset['currency']}</b>: ${asset['value']:,.2f}\n"
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="menu_portfolio"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_buy":
+        text = "💰 <b>QUICK BUY</b>\n━━━━━━━━━━━━━━━\n\nSelect coin to buy:"
+        keyboard = [
+            [InlineKeyboardButton("BTC", callback_data="quickbuy_BTC"), InlineKeyboardButton("ETH", callback_data="quickbuy_ETH"), InlineKeyboardButton("SOL", callback_data="quickbuy_SOL")],
+            [InlineKeyboardButton("XRP", callback_data="quickbuy_XRP"), InlineKeyboardButton("DOGE", callback_data="quickbuy_DOGE"), InlineKeyboardButton("ADA", callback_data="quickbuy_ADA")],
+            [InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+        ]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_sell":
+        holdings = {"assets": []}
+        if cdp_client:
+            holdings = await cdp_client.get_all_holdings()
+        text = "💸 <b>QUICK SELL</b>\n━━━━━━━━━━━━━━━\n\n"
+        keyboard = []
+        for asset in holdings["assets"][:6]:
+            text += f"• {asset['currency']}: ${asset['value']:,.2f}\n"
+            keyboard.append([InlineKeyboardButton(f"Sell {asset['currency']}", callback_data=f"sell_menu_{asset['currency']}")])
+        keyboard.append([InlineKeyboardButton("🔙 Menu", callback_data="menu_back")])
+        if not holdings["assets"]:
+            text += "No holdings to sell"
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_market":
+        text = "📈 <b>LIVE MARKET</b>\n━━━━━━━━━━━━━━━\n\n"
+        for pair in TRADING_PAIRS[:8]:
+            price = await get_public_price(pair)
+            text += f"🪙 <b>{pair.split('-')[0]}</b>: ${price:,.2f}\n"
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="menu_market"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_fear":
+        fg = await get_fear_greed_index()
+        value = fg["value"]
+        emoji = "😱" if value <= 25 else "😰" if value <= 45 else "😐" if value <= 55 else "😊" if value <= 75 else "🤑"
+        text = f"😱 <b>FEAR & GREED INDEX</b>\n━━━━━━━━━━━━━━━\n\n"
+        text += f"{emoji} Value: <b>{value}</b>\n"
+        text += f"📊 Status: {fg['classification']}\n\n"
+        text += "0-25: Extreme Fear (Buy)\n26-45: Fear\n46-55: Neutral\n56-75: Greed\n76-100: Extreme Greed (Sell)"
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="menu_fear"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_regime":
+        regime = await detect_market_regime()
+        text = f"🔍 <b>MARKET REGIME</b>\n━━━━━━━━━━━━━━━\n\n"
+        text += f"📊 {regime.get('regime_display', 'Unknown')}\n\n"
+        text += f"Confidence: {regime.get('confidence', 0)}%\n"
+        text += f"Volatility: {regime.get('volatility', 0):.1f}%\n"
+        text += f"Trend: {regime.get('trend_strength', 0):.1f}%"
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="menu_regime"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_news":
+        news = await get_crypto_news()
+        text = "📰 <b>CRYPTO NEWS</b>\n━━━━━━━━━━━━━━━\n\n"
+        for n in news[:4]:
+            text += f"• {n['title'][:60]}...\n\n"
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="menu_news"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_autopilot":
+        status = "🟢 ACTIVE" if autopilot_settings["enabled"] else "🔴 OFF"
+        text = f"🤖 <b>AUTOPILOT</b>\n━━━━━━━━━━━━━━━\n\n"
+        text += f"Status: {status}\n"
+        text += f"Trades today: {autopilot_settings['trades_today']}/{autopilot_settings['max_daily_trades']}\n"
+        text += f"Total profit: ${autopilot_settings['total_profit']:+,.2f}\n"
+        toggle = "autopilot_off" if autopilot_settings["enabled"] else "autopilot_on"
+        toggle_text = "🔴 Turn OFF" if autopilot_settings["enabled"] else "🟢 Turn ON"
+        keyboard = [[InlineKeyboardButton(toggle_text, callback_data=toggle)], [InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_performance":
+        total_trades = len(trade_history)
+        total_pnl = sum(t.get("pnl_usd", 0) for t in trade_history)
+        wins = sum(1 for t in trade_history if t.get("pnl_usd", 0) > 0)
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+        text = f"📈 <b>PERFORMANCE</b>\n━━━━━━━━━━━━━━━\n\n"
+        text += f"Total Trades: {total_trades}\n"
+        text += f"Win Rate: {win_rate:.1f}%\n"
+        text += f"Total P&L: ${total_pnl:+,.2f}"
+        keyboard = [[InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_history":
+        text = "📜 <b>RECENT TRADES</b>\n━━━━━━━━━━━━━━━\n\n"
+        for trade in trade_history[-5:][::-1]:
+            emoji = "🟢" if trade.get("pnl_usd", 0) >= 0 else "🔴"
+            text += f"{emoji} {trade.get('pair')}: ${trade.get('pnl_usd', 0):+.2f}\n"
+        if not trade_history:
+            text += "No trades yet"
+        keyboard = [[InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_settings":
+        text = f"⚙️ <b>SETTINGS</b>\n━━━━━━━━━━━━━━━\n\n"
+        text += f"Trade: ${TRADE_AMOUNT_USD}\n"
+        text += f"Stop Loss: {STOP_LOSS_PCT}%\n"
+        text += f"Take Profit: {TAKE_PROFIT_PCT}%\n"
+        text += f"Mode: {'🔴 LIVE' if LIVE_TRADING else '🟡 PAPER'}"
+        keyboard = [[InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_back":
+        keyboard = [
+            [InlineKeyboardButton("📊 Signals", callback_data="menu_signals"), InlineKeyboardButton("💼 Portfolio", callback_data="menu_portfolio")],
+            [InlineKeyboardButton("💰 Buy", callback_data="menu_buy"), InlineKeyboardButton("💸 Sell", callback_data="menu_sell")],
+            [InlineKeyboardButton("📈 Market", callback_data="menu_market"), InlineKeyboardButton("😱 Fear/Greed", callback_data="menu_fear")],
+            [InlineKeyboardButton("🔍 Regime", callback_data="menu_regime"), InlineKeyboardButton("📰 News", callback_data="menu_news")],
+            [InlineKeyboardButton("🤖 Autopilot", callback_data="menu_autopilot"), InlineKeyboardButton("📊 Performance", callback_data="menu_performance")]
+        ]
+        await query.edit_message_text("🚀 <b>QUANTSIGNALS ULTRA</b>\n\nSelect an option:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data.startswith("quickbuy_"):
+        coin = data.replace("quickbuy_", "")
+        pair = f"{coin}-USD"
+        price = await get_public_price(pair)
+        keyboard = [
+            [InlineKeyboardButton(f"Buy $10", callback_data=f"confirm_buy_{pair}_10")],
+            [InlineKeyboardButton(f"Buy $25", callback_data=f"confirm_buy_{pair}_25")],
+            [InlineKeyboardButton(f"Buy $50", callback_data=f"confirm_buy_{pair}_50")],
+            [InlineKeyboardButton(f"Buy $100", callback_data=f"confirm_buy_{pair}_100")],
+            [InlineKeyboardButton("🔙 Back", callback_data="menu_buy")]
+        ]
+        await query.edit_message_text(
+            f"💰 <b>BUY {coin}</b>\n\n"
+            f"Price: ${price:,.2f}\n\n"
+            f"Select amount:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif data == "autopilot_on":
+        autopilot_settings["enabled"] = True
+        autopilot_settings["trades_today"] = 0
+        save_data("autopilot", autopilot_settings)
+        await query.edit_message_text(
+            "🤖 <b>AUTOPILOT ENABLED</b>\n\n"
+            f"Mode: {'🔴 LIVE' if LIVE_TRADING else '🟡 PAPER'}\n"
+            "Bot will auto-trade high confidence signals!",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]])
+        )
+    
+    elif data == "autopilot_off":
+        autopilot_settings["enabled"] = False
+        save_data("autopilot", autopilot_settings)
+        await query.edit_message_text(
+            "👤 <b>AUTOPILOT DISABLED</b>\n\n"
+            "Switched to manual mode.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]])
+        )
+    
+    elif data == "refresh_portfolio":
         # Refresh portfolio - call portfolio logic
         await query.edit_message_text("📊 Refreshing portfolio...")
         
@@ -2613,6 +2834,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ REGISTER HANDLERS ============
 tg_app.add_handler(CommandHandler("start", start))
 tg_app.add_handler(CommandHandler("help", help_cmd))
+tg_app.add_handler(CommandHandler("menu", menu_cmd))
 tg_app.add_handler(CommandHandler("signals", signals_cmd))
 tg_app.add_handler(CommandHandler("market", market_cmd))
 tg_app.add_handler(CommandHandler("portfolio", portfolio_cmd))
