@@ -285,24 +285,77 @@ async def get_whale_alerts() -> list:
 
 # ============ FEATURE 9: NEWS INTEGRATION ============
 async def get_crypto_news() -> list:
-    """Get latest crypto news headlines."""
-    # Using CryptoPanic public feed (no auth needed for basic)
-    url = "https://cryptopanic.com/api/v1/posts/?auth_token=free&public=true&kind=news"
+    """Get latest crypto news headlines from multiple sources."""
+    news = []
+    
+    # Try CoinGecko news (free, no auth)
     try:
+        url = "https://api.coingecko.com/api/v3/news"
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, timeout=10)
-            data = resp.json()
-            news = []
-            for item in data.get("results", [])[:5]:
-                news.append({
-                    "title": item.get("title", "")[:100],
-                    "source": item.get("source", {}).get("title", ""),
-                    "url": item.get("url", ""),
-                    "currencies": [c.get("code") for c in item.get("currencies", [])]
-                })
-            return news
+            if resp.status_code == 200:
+                data = resp.json()
+                for item in data.get("data", [])[:5]:
+                    news.append({
+                        "title": item.get("title", "")[:100],
+                        "source": item.get("author", "CoinGecko"),
+                        "url": item.get("url", ""),
+                        "currencies": []
+                    })
+                if news:
+                    return news
+    except Exception as e:
+        print(f"[NEWS] CoinGecko error: {e}")
+    
+    # Fallback: CryptoCompare news (free)
+    try:
+        url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN"
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for item in data.get("Data", [])[:5]:
+                    categories = item.get("categories", "").split("|")
+                    news.append({
+                        "title": item.get("title", "")[:100],
+                        "source": item.get("source", "Unknown"),
+                        "url": item.get("url", ""),
+                        "currencies": [c.strip() for c in categories[:3] if c.strip()]
+                    })
+                if news:
+                    return news
+    except Exception as e:
+        print(f"[NEWS] CryptoCompare error: {e}")
+    
+    # Final fallback: Return market-based "news"
+    try:
+        fg = await get_fear_greed_index()
+        news.append({
+            "title": f"Market sentiment: {fg.get('classification', 'Neutral')} (Fear & Greed: {fg.get('value', 50)})",
+            "source": "Market Data",
+            "url": "",
+            "currencies": ["BTC", "ETH"]
+        })
+        
+        # Add top mover as news
+        for pair in ["BTC-USD", "ETH-USD", "SOL-USD"]:
+            candles = await get_public_candles(pair)
+            if candles and candles.get("prices"):
+                prices = candles["prices"]
+                if len(prices) >= 2:
+                    change = ((prices[0] - prices[1]) / prices[1]) * 100
+                    coin = pair.split("-")[0]
+                    direction = "up" if change > 0 else "down"
+                    news.append({
+                        "title": f"{coin} is {direction} {abs(change):.1f}% in the last hour",
+                        "source": "Price Alert",
+                        "url": "",
+                        "currencies": [coin]
+                    })
     except:
-        return []
+        pass
+    
+    return news
 
 
 # ============ FEATURE 2: MULTI-TIMEFRAME ANALYSIS ============
