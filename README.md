@@ -9,6 +9,7 @@
 ![Coinbase](https://img.shields.io/badge/Coinbase-CDP-0052FF?logo=coinbase&logoColor=white)
 ![Redis](https://img.shields.io/badge/Redis-Persistence-DC382D?logo=redis&logoColor=white)
 ![Railway](https://img.shields.io/badge/Railway-Deployed-0B0D0E?logo=railway&logoColor=white)
+</div>
 
 **Elite Quantitative Crypto Trading Intelligence**
 
