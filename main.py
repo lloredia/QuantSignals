@@ -54,17 +54,25 @@ def save_positions():
     save_data("price_alerts", price_alerts)
     save_data("trade_history", trade_history)
     save_data("strategy_performance", strategy_performance)
+    save_data("autopilot_settings", autopilot_settings)
 
 
 def load_positions():
-    global positions, daily_pnl, signal_history, price_alerts, trade_history, strategy_performance
+    global positions, daily_pnl, signal_history, price_alerts, trade_history, strategy_performance, autopilot_settings
     positions = load_data("positions", {})
     daily_pnl = load_data("daily_pnl", {"realized": 0.0, "trades": 0, "wins": 0})
     signal_history = load_data("signal_history", [])
     price_alerts = load_data("price_alerts", {})
     trade_history = load_data("trade_history", [])
     strategy_performance = load_data("strategy_performance", strategy_performance)
+    
+    # Load autopilot settings - preserve enabled state!
+    saved_autopilot = load_data("autopilot_settings", {})
+    if saved_autopilot:
+        autopilot_settings.update(saved_autopilot)
+    
     print(f"[REDIS] Loaded {len(positions)} positions, {len(trade_history)} trades")
+    print(f"[REDIS] Autopilot: {'ENABLED' if autopilot_settings.get('enabled') else 'DISABLED'}")
 
 
 # ============ CONFIG ============
@@ -2397,14 +2405,146 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data == "menu_autopilot":
         status = "🟢 ACTIVE" if autopilot_settings["enabled"] else "🔴 OFF"
-        text = f"🤖 <b>AUTOPILOT</b>\n━━━━━━━━━━━━━━━\n\n"
-        text += f"Status: {status}\n"
-        text += f"Trades today: {autopilot_settings['trades_today']}/{autopilot_settings['max_daily_trades']}\n"
-        text += f"Total profit: ${autopilot_settings['total_profit']:+,.2f}\n"
-        toggle = "autopilot_off" if autopilot_settings["enabled"] else "autopilot_on"
-        toggle_text = "🔴 Turn OFF" if autopilot_settings["enabled"] else "🟢 Turn ON"
-        keyboard = [[InlineKeyboardButton(toggle_text, callback_data=toggle)], [InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
+        usd_balance = 0
+        if cdp_client:
+            usd_balance = await cdp_client.get_usd_balance()
+        
+        # Calculate next trade size
+        trade_size = usd_balance * autopilot_settings["trade_percentage"] / 100
+        trade_size = max(autopilot_settings["min_trade_usd"], min(autopilot_settings["max_trade_usd"], trade_size))
+        
+        text = f"""🤖 <b>AUTOPILOT CONTROL CENTER</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+<b>Status:</b> {status}
+<b>Mode:</b> {'🔴 LIVE TRADING' if LIVE_TRADING else '🟡 PAPER MODE'}
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>💰 ACCOUNT</b>
+━━━━━━━━━━━━━━━━━━━━━
+Balance: <code>${usd_balance:,.2f}</code>
+Next Trade: <code>~${trade_size:,.2f}</code>
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>📊 SETTINGS</b>
+━━━━━━━━━━━━━━━━━━━━━
+Trade Size: {autopilot_settings['trade_percentage']}% of balance
+Min Trade: ${autopilot_settings['min_trade_usd']}
+Max Trade: ${autopilot_settings['max_trade_usd']}
+Min Confidence: {autopilot_settings['min_confidence']}%
+Min EV: {autopilot_settings.get('min_expected_value', 1.5)}%
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>📈 TODAY'S ACTIVITY</b>
+━━━━━━━━━━━━━━━━━━━━━
+Trades: {autopilot_settings['trades_today']}/{autopilot_settings['max_daily_trades']}
+Profit: ${autopilot_settings['total_profit']:+,.2f}
+Regime: {autopilot_settings.get('current_regime', 'unknown')}
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>⚙️ RISK CONTROLS</b>
+━━━━━━━━━━━━━━━━━━━━━
+Kelly Sizing: {'✅' if autopilot_settings.get('use_kelly') else '❌'}
+Reinvest: {'✅' if autopilot_settings.get('reinvest_profits') else '❌'}
+Daily Target: {autopilot_settings.get('daily_target_pct', 3)}%
+"""
+        
+        # Build keyboard based on current state
+        toggle_text = "🔴 STOP AUTOPILOT" if autopilot_settings["enabled"] else "🟢 START AUTOPILOT"
+        toggle_action = "autopilot_off" if autopilot_settings["enabled"] else "autopilot_on"
+        
+        keyboard = [
+            [InlineKeyboardButton(toggle_text, callback_data=toggle_action)],
+            [InlineKeyboardButton("━━━ TRADE SIZE ━━━", callback_data="none")],
+            [
+                InlineKeyboardButton("10%", callback_data="ap_pct_10"),
+                InlineKeyboardButton("15%", callback_data="ap_pct_15"),
+                InlineKeyboardButton("20%", callback_data="ap_pct_20"),
+                InlineKeyboardButton("25%", callback_data="ap_pct_25")
+            ],
+            [InlineKeyboardButton("━━━ MIN CONFIDENCE ━━━", callback_data="none")],
+            [
+                InlineKeyboardButton("65%", callback_data="ap_conf_65"),
+                InlineKeyboardButton("70%", callback_data="ap_conf_70"),
+                InlineKeyboardButton("75%", callback_data="ap_conf_75"),
+                InlineKeyboardButton("80%", callback_data="ap_conf_80")
+            ],
+            [InlineKeyboardButton("━━━ MAX TRADES/DAY ━━━", callback_data="none")],
+            [
+                InlineKeyboardButton("5", callback_data="ap_max_5"),
+                InlineKeyboardButton("10", callback_data="ap_max_10"),
+                InlineKeyboardButton("15", callback_data="ap_max_15"),
+                InlineKeyboardButton("20", callback_data="ap_max_20")
+            ],
+            [InlineKeyboardButton("━━━ MAX TRADE $ ━━━", callback_data="none")],
+            [
+                InlineKeyboardButton("$50", callback_data="ap_maxusd_50"),
+                InlineKeyboardButton("$100", callback_data="ap_maxusd_100"),
+                InlineKeyboardButton("$250", callback_data="ap_maxusd_250"),
+                InlineKeyboardButton("$500", callback_data="ap_maxusd_500")
+            ],
+            [InlineKeyboardButton("━━━ TOGGLES ━━━", callback_data="none")],
+            [
+                InlineKeyboardButton(f"Kelly: {'✅' if autopilot_settings.get('use_kelly') else '❌'}", callback_data="ap_toggle_kelly"),
+                InlineKeyboardButton(f"Reinvest: {'✅' if autopilot_settings.get('reinvest_profits') else '❌'}", callback_data="ap_toggle_reinvest")
+            ],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="menu_autopilot"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+        ]
+        
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    # Autopilot setting handlers
+    elif data.startswith("ap_pct_"):
+        pct = int(data.replace("ap_pct_", ""))
+        autopilot_settings["trade_percentage"] = pct
+        save_data("autopilot_settings", autopilot_settings)
+        await query.answer(f"✅ Trade size set to {pct}%")
+        # Refresh the menu
+        await button_callback(update, context)
+    
+    elif data.startswith("ap_conf_"):
+        conf = int(data.replace("ap_conf_", ""))
+        autopilot_settings["min_confidence"] = conf
+        save_data("autopilot_settings", autopilot_settings)
+        await query.answer(f"✅ Min confidence set to {conf}%")
+        # Trigger refresh by setting data and calling again
+        query.data = "menu_autopilot"
+        await button_callback(update, context)
+    
+    elif data.startswith("ap_max_"):
+        max_trades = int(data.replace("ap_max_", ""))
+        autopilot_settings["max_daily_trades"] = max_trades
+        save_data("autopilot_settings", autopilot_settings)
+        await query.answer(f"✅ Max trades set to {max_trades}/day")
+        query.data = "menu_autopilot"
+        await button_callback(update, context)
+    
+    elif data.startswith("ap_maxusd_"):
+        max_usd = int(data.replace("ap_maxusd_", ""))
+        autopilot_settings["max_trade_usd"] = max_usd
+        save_data("autopilot_settings", autopilot_settings)
+        await query.answer(f"✅ Max trade set to ${max_usd}")
+        query.data = "menu_autopilot"
+        await button_callback(update, context)
+    
+    elif data == "ap_toggle_kelly":
+        autopilot_settings["use_kelly"] = not autopilot_settings.get("use_kelly", True)
+        save_data("autopilot_settings", autopilot_settings)
+        status = "ON" if autopilot_settings["use_kelly"] else "OFF"
+        await query.answer(f"✅ Kelly sizing {status}")
+        query.data = "menu_autopilot"
+        await button_callback(update, context)
+    
+    elif data == "ap_toggle_reinvest":
+        autopilot_settings["reinvest_profits"] = not autopilot_settings.get("reinvest_profits", True)
+        save_data("autopilot_settings", autopilot_settings)
+        status = "ON" if autopilot_settings["reinvest_profits"] else "OFF"
+        await query.answer(f"✅ Reinvest profits {status}")
+        query.data = "menu_autopilot"
+        await button_callback(update, context)
+    
+    elif data == "none":
+        await query.answer()  # Do nothing for separator buttons
     
     elif data == "menu_performance":
         total_trades = len(trade_history)
@@ -2469,23 +2609,52 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "autopilot_on":
         autopilot_settings["enabled"] = True
         autopilot_settings["trades_today"] = 0
-        save_data("autopilot", autopilot_settings)
+        save_data("autopilot_settings", autopilot_settings)
+        save_positions()  # Also save to ensure persistence
+        
+        usd_balance = 0
+        if cdp_client:
+            usd_balance = await cdp_client.get_usd_balance()
+        
+        await query.answer("🟢 Autopilot ENABLED!")
+        
         await query.edit_message_text(
-            "🤖 <b>AUTOPILOT ENABLED</b>\n\n"
-            f"Mode: {'🔴 LIVE' if LIVE_TRADING else '🟡 PAPER'}\n"
-            "Bot will auto-trade high confidence signals!",
+            f"🟢 <b>AUTOPILOT ACTIVATED!</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Balance: ${usd_balance:,.2f}\n"
+            f"📊 Trade Size: {autopilot_settings['trade_percentage']}%\n"
+            f"🎯 Min Confidence: {autopilot_settings['min_confidence']}%\n"
+            f"📈 Max Trades: {autopilot_settings['max_daily_trades']}/day\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Mode: {'🔴 LIVE TRADING' if LIVE_TRADING else '🟡 PAPER MODE'}\n\n"
+            f"<i>Bot is now scanning for opportunities...</i>",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Autopilot Settings", callback_data="menu_autopilot")],
+                [InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+            ])
         )
     
     elif data == "autopilot_off":
         autopilot_settings["enabled"] = False
-        save_data("autopilot", autopilot_settings)
+        save_data("autopilot_settings", autopilot_settings)
+        save_positions()
+        
+        await query.answer("🔴 Autopilot DISABLED!")
+        
         await query.edit_message_text(
-            "👤 <b>AUTOPILOT DISABLED</b>\n\n"
-            "Switched to manual mode.",
+            f"🔴 <b>AUTOPILOT STOPPED</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Trades Today: {autopilot_settings['trades_today']}\n"
+            f"💰 Session Profit: ${autopilot_settings['total_profit']:+,.2f}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Switched to manual mode.\n"
+            f"Open positions still have stop-loss active.",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🟢 Turn Back ON", callback_data="autopilot_on")],
+                [InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+            ])
         )
     
     elif data == "refresh_portfolio":
