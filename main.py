@@ -55,21 +55,44 @@ def save_positions():
     save_data("trade_history", trade_history)
     save_data("strategy_performance", strategy_performance)
     save_data("autopilot_settings", autopilot_settings)
+    save_data("watchlist", watchlist)
+    save_data("risk_state", risk_state)
+    save_data("tp_tiers", tp_tiers)
+    save_data("dca_settings", dca_settings)
+    save_data("perf_stats", perf_stats)
 
 
 def load_positions():
-    global positions, daily_pnl, signal_history, price_alerts, trade_history, strategy_performance, autopilot_settings
+    global positions, daily_pnl, signal_history, price_alerts, trade_history
+    global strategy_performance, autopilot_settings, watchlist, risk_state
+    global tp_tiers, dca_settings, perf_stats
+    
     positions = load_data("positions", {})
-    daily_pnl = load_data("daily_pnl", {"realized": 0.0, "trades": 0, "wins": 0})
+    daily_pnl = load_data("daily_pnl", {"realized": 0.0, "trades": 0, "wins": 0, "starting_balance": 0})
     signal_history = load_data("signal_history", [])
     price_alerts = load_data("price_alerts", {})
     trade_history = load_data("trade_history", [])
     strategy_performance = load_data("strategy_performance", strategy_performance)
     
-    # Load autopilot settings - preserve enabled state!
+    # Load autopilot settings
     saved_autopilot = load_data("autopilot_settings", {})
     if saved_autopilot:
         autopilot_settings.update(saved_autopilot)
+    
+    # Load new state
+    watchlist = load_data("watchlist", {})
+    saved_risk = load_data("risk_state", {})
+    if saved_risk:
+        risk_state.update(saved_risk)
+    saved_tp = load_data("tp_tiers", {})
+    if saved_tp:
+        tp_tiers.update(saved_tp)
+    saved_dca = load_data("dca_settings", {})
+    if saved_dca:
+        dca_settings.update(saved_dca)
+    saved_perf = load_data("perf_stats", {})
+    if saved_perf:
+        perf_stats.update(saved_perf)
     
     print(f"[REDIS] Loaded {len(positions)} positions, {len(trade_history)} trades")
     print(f"[REDIS] Autopilot: {'ENABLED' if autopilot_settings.get('enabled') else 'DISABLED'}")
@@ -135,10 +158,52 @@ tg_app = Application.builder().token(TOKEN).build()
 
 # State tracking
 positions = {}
-daily_pnl = {"realized": 0.0, "trades": 0, "wins": 0}
+daily_pnl = {"realized": 0.0, "trades": 0, "wins": 0, "starting_balance": 0}
 signal_history = []  # Feature 7: Leaderboard
 price_alerts = {}  # Feature 8: Custom Alerts
 trade_history = []  # Trade history for reports
+watchlist = {}  # Watchlist with alerts
+
+# Risk Management State
+risk_state = {
+    "max_drawdown_pct": 10,  # Auto-pause if down this %
+    "daily_loss_limit": 50,  # Max $ loss per day
+    "max_position_pct": 30,  # Max % of portfolio in one coin
+    "paused_reason": None,   # Why trading paused
+    "highest_balance": 0,    # For drawdown calc
+    "current_drawdown": 0
+}
+
+# Take Profit Tiers
+tp_tiers = {
+    "enabled": True,
+    "tiers": [
+        {"pct_gain": 5, "sell_pct": 25},   # At +5%, sell 25%
+        {"pct_gain": 10, "sell_pct": 25},  # At +10%, sell another 25%
+        {"pct_gain": 20, "sell_pct": 25},  # At +20%, sell another 25%
+        # Remaining 25% rides with trailing stop
+    ]
+}
+
+# DCA Settings
+dca_settings = {
+    "enabled": False,
+    "coins": ["BTC-USD", "ETH-USD"],
+    "drop_pct": 5,       # Buy when down 5%
+    "amount_usd": 25,    # DCA amount
+    "max_per_day": 3,    # Max DCA buys per day
+    "today_count": 0
+}
+
+# Performance Stats
+perf_stats = {
+    "best_trade": {"pair": None, "pnl_pct": 0, "pnl_usd": 0},
+    "worst_trade": {"pair": None, "pnl_pct": 0, "pnl_usd": 0},
+    "current_streak": 0,
+    "best_streak": 0,
+    "worst_streak": 0,
+    "total_volume": 0
+}
 
 # Live trading mode
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
@@ -984,43 +1049,58 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ═══════════════════════════════════
 
-<b>💰 Trading:</b>
-/buy [coin] [amount] - Quick buy
-/sell [coin] [%] - Quick sell
+<b>💰 TRADING</b>
+/buy [coin] [amt] - Quick buy
+/sell [coin] [%] - Quick sell  
 /limit [coin] [price] - Limit alert
 /signals - AI quantitative signals
 
-<b>📊 Portfolio:</b>
+<b>📊 PORTFOLIO</b>
 /portfolio - All holdings + P&L
 /pnl - Today's P&L
 /history - Trade history
-/performance - Weekly/monthly report
+/performance - Full report
 
-<b>📈 Analysis:</b>
-/regime - Market regime detection
+<b>📈 ANALYSIS</b>
+/regime - Market regime
 /fear - Fear & Greed Index
 /news - Crypto news
-/timeframe [coin] - Multi-TF
+/tf [coin] - Multi-timeframe
 /whale - Whale alerts
 
-<b>🤖 Ultra Mode:</b>
-/autopilot - Autonomous trading
-/strategies - Strategy performance
-/stats - Portfolio statistics
+<b>🤖 AUTOPILOT</b>
+/autopilot - Auto trading control
+/dcaauto - DCA autopilot
+/tptiers - Take profit tiers
 /pause - Pause trading
 
-<b>⚙️ Tools:</b>
+<b>🛡️ RISK</b>
+/risk - Risk dashboard
+/watchlist - Your watchlist
+
+<b>📊 ANALYTICS</b>
+/chart - P&L chart
+/streak - Win/loss streak
+/besttrades - Best & worst trades
+/summary - Daily summary
+
+<b>⚙️ TOOLS</b>
+/menu - Interactive menu
 /market - Live prices
-/alerts - View all alerts
-/backtest [coin] - Strategy backtest
-/leaderboard - Signal performance
-/dca - DCA opportunities
+/alerts - View alerts
+/backtest - Backtest strategy
 /settings - Bot settings
 
 ═══════════════════════════════════
 <i>Capital Preservation → Consistency → Compounding</i>"""
     
-    await update.message.reply_text(welcome, parse_mode="HTML")
+    keyboard = [
+        [InlineKeyboardButton("📊 Signals", callback_data="menu_signals"), InlineKeyboardButton("💼 Portfolio", callback_data="menu_portfolio")],
+        [InlineKeyboardButton("🤖 Autopilot", callback_data="menu_autopilot"), InlineKeyboardButton("🛡️ Risk", callback_data="menu_risk")],
+        [InlineKeyboardButton("📈 Full Menu", callback_data="menu_back")]
+    ]
+    
+    await update.message.reply_text(welcome, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2116,6 +2196,549 @@ async def alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
+# ============ RISK MANAGEMENT ============
+async def risk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Risk management dashboard."""
+    args = context.args
+    
+    # Get current portfolio value
+    total_value = 0
+    if cdp_client:
+        holdings = await cdp_client.get_all_holdings()
+        total_value = holdings.get("total_value", 0)
+    
+    # Calculate current drawdown
+    if total_value > risk_state["highest_balance"]:
+        risk_state["highest_balance"] = total_value
+    
+    drawdown = 0
+    if risk_state["highest_balance"] > 0:
+        drawdown = ((risk_state["highest_balance"] - total_value) / risk_state["highest_balance"]) * 100
+    risk_state["current_drawdown"] = drawdown
+    
+    # Calculate position concentration
+    position_pcts = []
+    if cdp_client:
+        holdings = await cdp_client.get_all_holdings()
+        for asset in holdings.get("assets", []):
+            if total_value > 0:
+                pct = (asset["value"] / total_value) * 100
+                position_pcts.append({"coin": asset["currency"], "pct": pct})
+    
+    position_pcts.sort(key=lambda x: x["pct"], reverse=True)
+    
+    # Check if paused
+    paused = risk_state.get("paused_reason")
+    
+    text = f"""🛡️ <b>RISK MANAGEMENT</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+<b>Status:</b> {'🔴 PAUSED - ' + paused if paused else '🟢 ACTIVE'}
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>💰 PORTFOLIO</b>
+━━━━━━━━━━━━━━━━━━━━━
+Current Value: <code>${total_value:,.2f}</code>
+Peak Value: <code>${risk_state['highest_balance']:,.2f}</code>
+Drawdown: <code>{drawdown:.1f}%</code> (max {risk_state['max_drawdown_pct']}%)
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>📊 DAILY LIMITS</b>
+━━━━━━━━━━━━━━━━━━━━━
+Today's P&L: <code>${daily_pnl['realized']:+,.2f}</code>
+Loss Limit: <code>${risk_state['daily_loss_limit']}</code>
+{'🔴 LIMIT HIT!' if daily_pnl['realized'] <= -risk_state['daily_loss_limit'] else '🟢 Within limits'}
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>📈 CONCENTRATION</b>
+━━━━━━━━━━━━━━━━━━━━━
+Max Position: {risk_state['max_position_pct']}%
+
+"""
+    for pos in position_pcts[:5]:
+        bar = "█" * int(pos["pct"] / 5) + "░" * (20 - int(pos["pct"] / 5))
+        warn = "⚠️" if pos["pct"] > risk_state["max_position_pct"] else ""
+        text += f"{pos['coin']}: {pos['pct']:.1f}% {warn}\n[{bar}]\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("━━━ DRAWDOWN LIMIT ━━━", callback_data="none")],
+        [
+            InlineKeyboardButton("5%", callback_data="risk_dd_5"),
+            InlineKeyboardButton("10%", callback_data="risk_dd_10"),
+            InlineKeyboardButton("15%", callback_data="risk_dd_15"),
+            InlineKeyboardButton("20%", callback_data="risk_dd_20")
+        ],
+        [InlineKeyboardButton("━━━ DAILY LOSS LIMIT ━━━", callback_data="none")],
+        [
+            InlineKeyboardButton("$25", callback_data="risk_dll_25"),
+            InlineKeyboardButton("$50", callback_data="risk_dll_50"),
+            InlineKeyboardButton("$100", callback_data="risk_dll_100"),
+            InlineKeyboardButton("$200", callback_data="risk_dll_200")
+        ],
+        [InlineKeyboardButton("━━━ MAX POSITION ━━━", callback_data="none")],
+        [
+            InlineKeyboardButton("20%", callback_data="risk_mp_20"),
+            InlineKeyboardButton("30%", callback_data="risk_mp_30"),
+            InlineKeyboardButton("40%", callback_data="risk_mp_40"),
+            InlineKeyboardButton("50%", callback_data="risk_mp_50")
+        ],
+        [InlineKeyboardButton("🔄 Reset Peak", callback_data="risk_reset_peak")],
+        [InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+    ]
+    
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ============ WATCHLIST ============
+async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manage watchlist."""
+    args = context.args
+    
+    if args and len(args) >= 1:
+        action = args[0].lower()
+        
+        if action == "add" and len(args) >= 2:
+            coin = args[1].upper()
+            pair = f"{coin}-USD"
+            target = float(args[2]) if len(args) > 2 else None
+            
+            watchlist[pair] = {
+                "added": datetime.now().isoformat(),
+                "target_price": target,
+                "notes": " ".join(args[3:]) if len(args) > 3 else None
+            }
+            save_positions()
+            await update.message.reply_text(f"✅ Added {coin} to watchlist")
+            return
+        
+        elif action == "remove" and len(args) >= 2:
+            coin = args[1].upper()
+            pair = f"{coin}-USD"
+            if pair in watchlist:
+                del watchlist[pair]
+                save_positions()
+                await update.message.reply_text(f"✅ Removed {coin} from watchlist")
+            else:
+                await update.message.reply_text(f"❌ {coin} not in watchlist")
+            return
+    
+    # Show watchlist
+    text = """👀 <b>WATCHLIST</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+"""
+    
+    if not watchlist:
+        text += "<i>Empty watchlist</i>\n\n"
+        text += "Add coins:\n<code>/watchlist add BTC</code>\n<code>/watchlist add ETH 4000</code>"
+    else:
+        for pair, data in watchlist.items():
+            price = await get_public_price(pair)
+            coin = pair.split("-")[0]
+            target = data.get("target_price")
+            
+            if target:
+                pct_to_target = ((target - price) / price) * 100
+                target_str = f"\n   🎯 Target: ${target:,.2f} ({pct_to_target:+.1f}%)"
+            else:
+                target_str = ""
+            
+            text += f"🪙 <b>{coin}</b>: ${price:,.2f}{target_str}\n\n"
+    
+    keyboard = []
+    for pair in list(watchlist.keys())[:4]:
+        coin = pair.split("-")[0]
+        keyboard.append([
+            InlineKeyboardButton(f"Buy {coin}", callback_data=f"quickbuy_{coin}"),
+            InlineKeyboardButton(f"Remove {coin}", callback_data=f"wl_remove_{coin}")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Menu", callback_data="menu_back")])
+    
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ============ TAKE PROFIT TIERS ============
+async def tptiers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Configure take profit tiers."""
+    
+    text = f"""🎯 <b>TAKE PROFIT TIERS</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+Status: {'🟢 ENABLED' if tp_tiers['enabled'] else '🔴 DISABLED'}
+
+<b>How it works:</b>
+Instead of one big take profit, sell in stages:
+
+"""
+    
+    remaining = 100
+    for i, tier in enumerate(tp_tiers["tiers"], 1):
+        text += f"📊 Tier {i}: At +{tier['pct_gain']}% → Sell {tier['sell_pct']}%\n"
+        remaining -= tier["sell_pct"]
+    
+    text += f"\n🔄 Remaining {remaining}% rides with trailing stop\n"
+    
+    text += """
+━━━━━━━━━━━━━━━━━━━━━
+<b>Example:</b>
+Buy $100 of BTC at $95,000
+
+• +5% ($99,750): Sell $25 ✅
+• +10% ($104,500): Sell $25 ✅
+• +20% ($114,000): Sell $25 ✅
+• Trailing stop protects final $25
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'🔴 Disable' if tp_tiers['enabled'] else '🟢 Enable'} Tiers",
+            callback_data="tp_toggle"
+        )],
+        [InlineKeyboardButton("Conservative", callback_data="tp_preset_conservative")],
+        [InlineKeyboardButton("Balanced", callback_data="tp_preset_balanced")],
+        [InlineKeyboardButton("Aggressive", callback_data="tp_preset_aggressive")],
+        [InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+    ]
+    
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ============ DCA AUTOPILOT ============
+async def dcaauto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """DCA autopilot settings."""
+    
+    text = f"""📉 <b>DCA AUTOPILOT</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+Status: {'🟢 ENABLED' if dca_settings['enabled'] else '🔴 DISABLED'}
+
+<b>Settings:</b>
+• Drop trigger: {dca_settings['drop_pct']}%
+• Amount per buy: ${dca_settings['amount_usd']}
+• Max buys/day: {dca_settings['max_per_day']}
+• Today's buys: {dca_settings['today_count']}
+
+<b>Watched Coins:</b>
+{', '.join([p.split('-')[0] for p in dca_settings['coins']])}
+
+<b>How it works:</b>
+When a coin drops {dca_settings['drop_pct']}% from 24h high,
+auto-buy ${dca_settings['amount_usd']} (up to {dca_settings['max_per_day']}x/day)
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'🔴 Disable' if dca_settings['enabled'] else '🟢 Enable'} DCA",
+            callback_data="dca_toggle"
+        )],
+        [InlineKeyboardButton("━━━ DROP TRIGGER ━━━", callback_data="none")],
+        [
+            InlineKeyboardButton("3%", callback_data="dca_drop_3"),
+            InlineKeyboardButton("5%", callback_data="dca_drop_5"),
+            InlineKeyboardButton("7%", callback_data="dca_drop_7"),
+            InlineKeyboardButton("10%", callback_data="dca_drop_10")
+        ],
+        [InlineKeyboardButton("━━━ BUY AMOUNT ━━━", callback_data="none")],
+        [
+            InlineKeyboardButton("$10", callback_data="dca_amt_10"),
+            InlineKeyboardButton("$25", callback_data="dca_amt_25"),
+            InlineKeyboardButton("$50", callback_data="dca_amt_50"),
+            InlineKeyboardButton("$100", callback_data="dca_amt_100")
+        ],
+        [InlineKeyboardButton("━━━ MAX/DAY ━━━", callback_data="none")],
+        [
+            InlineKeyboardButton("1", callback_data="dca_max_1"),
+            InlineKeyboardButton("3", callback_data="dca_max_3"),
+            InlineKeyboardButton("5", callback_data="dca_max_5"),
+            InlineKeyboardButton("10", callback_data="dca_max_10")
+        ],
+        [InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+    ]
+    
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ============ DAILY SUMMARY ============
+async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate daily summary."""
+    await send_daily_summary(update.effective_chat.id)
+
+
+async def send_daily_summary(chat_id: int):
+    """Send daily summary report."""
+    tz = pytz.timezone("America/Chicago")
+    now = datetime.now(tz)
+    
+    # Get portfolio value
+    total_value = 0
+    usd_balance = 0
+    crypto_value = 0
+    if cdp_client:
+        holdings = await cdp_client.get_all_holdings()
+        total_value = holdings.get("total_value", 0)
+        usd_balance = holdings.get("usd_balance", 0)
+        crypto_value = holdings.get("crypto_value", 0)
+    
+    # Today's trades
+    today_trades = [t for t in trade_history if t.get("closed_at", "").startswith(now.date().isoformat())]
+    today_pnl = sum(t.get("pnl_usd", 0) for t in today_trades)
+    today_wins = sum(1 for t in today_trades if t.get("pnl_usd", 0) > 0)
+    today_wr = (today_wins / len(today_trades) * 100) if today_trades else 0
+    
+    # Best/worst today
+    best_today = max(today_trades, key=lambda x: x.get("pnl_usd", 0)) if today_trades else None
+    worst_today = min(today_trades, key=lambda x: x.get("pnl_usd", 0)) if today_trades else None
+    
+    # Open positions P&L
+    open_pnl = 0
+    for pair, pos in positions.items():
+        price = await get_public_price(pair)
+        entry = pos["entry_price"]
+        pnl = ((price - entry) / entry) * pos.get("amount_usd", 0) / 100
+        open_pnl += pnl
+    
+    text = f"""📊 <b>DAILY SUMMARY</b>
+{now.strftime("%A, %B %d, %Y")}
+━━━━━━━━━━━━━━━━━━━━━
+
+<b>💰 PORTFOLIO</b>
+Total: <code>${total_value:,.2f}</code>
+Cash: ${usd_balance:,.2f} | Crypto: ${crypto_value:,.2f}
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>📈 TODAY'S PERFORMANCE</b>
+━━━━━━━━━━━━━━━━━━━━━
+Realized P&L: <b>${today_pnl:+,.2f}</b>
+Unrealized P&L: ${open_pnl:+,.2f}
+Trades: {len(today_trades)} | Win Rate: {today_wr:.0f}%
+"""
+    
+    if best_today:
+        text += f"\n🏆 Best: {best_today['pair']} ${best_today['pnl_usd']:+.2f}"
+    if worst_today and worst_today.get("pnl_usd", 0) < 0:
+        text += f"\n💔 Worst: {worst_today['pair']} ${worst_today['pnl_usd']:.2f}"
+    
+    text += f"""
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>🤖 AUTOPILOT</b>
+━━━━━━━━━━━━━━━━━━━━━
+Status: {'🟢 ON' if autopilot_settings['enabled'] else '🔴 OFF'}
+Auto Trades: {autopilot_settings['trades_today']}
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>📊 OPEN POSITIONS</b>
+━━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    if positions:
+        for pair, pos in list(positions.items())[:5]:
+            price = await get_public_price(pair)
+            entry = pos["entry_price"]
+            pnl_pct = ((price - entry) / entry) * 100
+            emoji = "🟢" if pnl_pct >= 0 else "🔴"
+            text += f"{emoji} {pair.split('-')[0]}: {pnl_pct:+.1f}%\n"
+    else:
+        text += "No open positions\n"
+    
+    text += "\n<i>Good night! 🌙</i>"
+    
+    try:
+        await tg_app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    except Exception as e:
+        print(f"[SUMMARY ERROR] {e}")
+
+
+# ============ PERFORMANCE CHARTS ============
+async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate performance chart."""
+    msg = await update.message.reply_text("📊 Generating chart...")
+    
+    if not trade_history:
+        await msg.edit_text("📊 No trade data for chart yet.")
+        return
+    
+    # Calculate cumulative P&L
+    cumulative = []
+    running_total = 0
+    for trade in trade_history[-50:]:  # Last 50 trades
+        running_total += trade.get("pnl_usd", 0)
+        cumulative.append(running_total)
+    
+    # Generate text-based chart
+    if cumulative:
+        max_val = max(cumulative) if max(cumulative) > 0 else 1
+        min_val = min(cumulative) if min(cumulative) < 0 else 0
+        range_val = max_val - min_val if max_val != min_val else 1
+        
+        chart_height = 10
+        chart_width = min(len(cumulative), 30)
+        
+        # Sample data if too many points
+        step = max(1, len(cumulative) // chart_width)
+        sampled = cumulative[::step][:chart_width]
+        
+        text = f"""📈 <b>P&L CHART</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+Last {len(trade_history)} trades:
+
+"""
+        
+        # Create ASCII chart
+        for row in range(chart_height, -1, -1):
+            threshold = min_val + (range_val * row / chart_height)
+            line = ""
+            for val in sampled:
+                if val >= threshold:
+                    line += "█"
+                elif row == chart_height // 2 and min_val <= 0 <= max_val:
+                    line += "─"
+                else:
+                    line += " "
+            
+            if row == chart_height:
+                text += f"<code>${max_val:+.0f} |{line}</code>\n"
+            elif row == 0:
+                text += f"<code>${min_val:+.0f} |{line}</code>\n"
+            elif row == chart_height // 2:
+                text += f"<code> $0  |{line}</code>\n"
+            else:
+                text += f"<code>     |{line}</code>\n"
+        
+        text += f"""
+━━━━━━━━━━━━━━━━━━━━━
+Final P&L: <b>${running_total:+,.2f}</b>
+Trades: {len(trade_history)}
+"""
+    else:
+        text = "📊 Not enough data for chart"
+    
+    await msg.edit_text(text, parse_mode="HTML")
+
+
+# ============ STREAK TRACKING ============
+async def streak_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show win/loss streaks."""
+    
+    # Calculate current streak
+    current_streak = 0
+    streak_type = None
+    
+    for trade in reversed(trade_history):
+        pnl = trade.get("pnl_usd", 0)
+        if streak_type is None:
+            streak_type = "win" if pnl > 0 else "loss"
+            current_streak = 1
+        elif (streak_type == "win" and pnl > 0) or (streak_type == "loss" and pnl <= 0):
+            current_streak += 1
+        else:
+            break
+    
+    # Calculate best/worst streaks
+    best_streak = 0
+    worst_streak = 0
+    temp_win = 0
+    temp_loss = 0
+    
+    for trade in trade_history:
+        if trade.get("pnl_usd", 0) > 0:
+            temp_win += 1
+            temp_loss = 0
+            best_streak = max(best_streak, temp_win)
+        else:
+            temp_loss += 1
+            temp_win = 0
+            worst_streak = max(worst_streak, temp_loss)
+    
+    perf_stats["current_streak"] = current_streak if streak_type == "win" else -current_streak
+    perf_stats["best_streak"] = best_streak
+    perf_stats["worst_streak"] = worst_streak
+    
+    streak_emoji = "🔥" * min(current_streak, 5) if streak_type == "win" else "❄️" * min(current_streak, 5)
+    
+    text = f"""🎰 <b>STREAK TRACKER</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+<b>Current Streak:</b>
+{streak_emoji}
+{current_streak} {'WINS' if streak_type == 'win' else 'LOSSES'} in a row!
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>Records:</b>
+🏆 Best Win Streak: {best_streak}
+💔 Worst Loss Streak: {worst_streak}
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>Recent Results:</b>
+"""
+    
+    for trade in trade_history[-10:][::-1]:
+        emoji = "✅" if trade.get("pnl_usd", 0) > 0 else "❌"
+        text += emoji
+    
+    text += "\n\n<i>Keep the streak going! 🚀</i>"
+    
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+# ============ BEST/WORST TRADES ============  
+async def besttrades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show best and worst trades."""
+    
+    if not trade_history:
+        await update.message.reply_text("📊 No trades yet.")
+        return
+    
+    # Sort by P&L
+    sorted_trades = sorted(trade_history, key=lambda x: x.get("pnl_usd", 0), reverse=True)
+    
+    best_5 = sorted_trades[:5]
+    worst_5 = sorted_trades[-5:][::-1]
+    
+    # Update perf stats
+    if best_5:
+        perf_stats["best_trade"] = best_5[0]
+    if worst_5:
+        perf_stats["worst_trade"] = worst_5[-1]
+    
+    text = """🏆 <b>BEST & WORST TRADES</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+<b>🥇 TOP 5 WINNERS</b>
+"""
+    
+    for i, trade in enumerate(best_5, 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
+        text += f"{medal} {trade.get('pair', 'N/A')}: <b>${trade.get('pnl_usd', 0):+.2f}</b> ({trade.get('pnl_pct', 0):+.1f}%)\n"
+    
+    text += """
+━━━━━━━━━━━━━━━━━━━━━
+<b>💔 TOP 5 LOSERS</b>
+"""
+    
+    for i, trade in enumerate(worst_5, 1):
+        text += f"  {trade.get('pair', 'N/A')}: <b>${trade.get('pnl_usd', 0):.2f}</b> ({trade.get('pnl_pct', 0):.1f}%)\n"
+    
+    # Stats
+    total_wins = sum(1 for t in trade_history if t.get("pnl_usd", 0) > 0)
+    total_losses = len(trade_history) - total_wins
+    avg_win = sum(t.get("pnl_usd", 0) for t in trade_history if t.get("pnl_usd", 0) > 0) / total_wins if total_wins else 0
+    avg_loss = sum(t.get("pnl_usd", 0) for t in trade_history if t.get("pnl_usd", 0) <= 0) / total_losses if total_losses else 0
+    
+    text += f"""
+━━━━━━━━━━━━━━━━━━━━━
+<b>📊 STATISTICS</b>
+Total Trades: {len(trade_history)}
+Wins: {total_wins} | Losses: {total_losses}
+Avg Win: ${avg_win:+.2f}
+Avg Loss: ${avg_loss:.2f}
+"""
+    
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Settings."""
     text = f"""⚙️ <b>SETTINGS</b>
@@ -2402,6 +3025,57 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"• {n['title'][:60]}...\n\n"
         keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data="menu_news"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]]
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_risk":
+        # Get portfolio value
+        total_value = 0
+        if cdp_client:
+            holdings = await cdp_client.get_all_holdings()
+            total_value = holdings.get("total_value", 0)
+        
+        drawdown = risk_state.get("current_drawdown", 0)
+        paused = risk_state.get("paused_reason")
+        
+        text = f"""🛡️ <b>RISK DASHBOARD</b>
+━━━━━━━━━━━━━━━━━━━━━
+
+Status: {'🔴 PAUSED - ' + paused if paused else '🟢 ACTIVE'}
+
+💰 Portfolio: ${total_value:,.2f}
+📉 Drawdown: {drawdown:.1f}%
+💔 Today's P&L: ${daily_pnl['realized']:+,.2f}
+
+━━━━━━━━━━━━━━━━━━━━━
+<b>Limits:</b>
+• Max Drawdown: {risk_state['max_drawdown_pct']}%
+• Daily Loss: ${risk_state['daily_loss_limit']}
+• Max Position: {risk_state['max_position_pct']}%
+"""
+        keyboard = [
+            [InlineKeyboardButton("⚙️ Configure", callback_data="menu_risk_config")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="menu_risk"), InlineKeyboardButton("🔙 Menu", callback_data="menu_back")]
+        ]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif data == "menu_risk_config":
+        keyboard = [
+            [InlineKeyboardButton("━━━ DRAWDOWN ━━━", callback_data="none")],
+            [
+                InlineKeyboardButton("5%", callback_data="risk_dd_5"),
+                InlineKeyboardButton("10%", callback_data="risk_dd_10"),
+                InlineKeyboardButton("15%", callback_data="risk_dd_15"),
+                InlineKeyboardButton("20%", callback_data="risk_dd_20")
+            ],
+            [InlineKeyboardButton("━━━ DAILY LOSS ━━━", callback_data="none")],
+            [
+                InlineKeyboardButton("$25", callback_data="risk_dll_25"),
+                InlineKeyboardButton("$50", callback_data="risk_dll_50"),
+                InlineKeyboardButton("$100", callback_data="risk_dll_100"),
+                InlineKeyboardButton("$200", callback_data="risk_dll_200")
+            ],
+            [InlineKeyboardButton("🔙 Back", callback_data="menu_risk")]
+        ]
+        await query.edit_message_text("🛡️ <b>RISK CONFIG</b>\n\nSelect limits:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
     
     elif data == "menu_autopilot":
         status = "🟢 ACTIVE" if autopilot_settings["enabled"] else "🔴 OFF"
@@ -2998,6 +3672,101 @@ Daily Target: {autopilot_settings.get('daily_target_pct', 3)}%
             f"<i>Copy the above CSV data</i>",
             parse_mode="HTML"
         )
+    
+    # ============ RISK MANAGEMENT CALLBACKS ============
+    elif data.startswith("risk_dd_"):
+        pct = int(data.replace("risk_dd_", ""))
+        risk_state["max_drawdown_pct"] = pct
+        save_positions()
+        await query.answer(f"✅ Max drawdown set to {pct}%")
+    
+    elif data.startswith("risk_dll_"):
+        limit = int(data.replace("risk_dll_", ""))
+        risk_state["daily_loss_limit"] = limit
+        save_positions()
+        await query.answer(f"✅ Daily loss limit set to ${limit}")
+    
+    elif data.startswith("risk_mp_"):
+        pct = int(data.replace("risk_mp_", ""))
+        risk_state["max_position_pct"] = pct
+        save_positions()
+        await query.answer(f"✅ Max position set to {pct}%")
+    
+    elif data == "risk_reset_peak":
+        if cdp_client:
+            holdings = await cdp_client.get_all_holdings()
+            risk_state["highest_balance"] = holdings.get("total_value", 0)
+        save_positions()
+        await query.answer("✅ Peak balance reset")
+    
+    # ============ WATCHLIST CALLBACKS ============
+    elif data.startswith("wl_remove_"):
+        coin = data.replace("wl_remove_", "")
+        pair = f"{coin}-USD"
+        if pair in watchlist:
+            del watchlist[pair]
+            save_positions()
+        await query.answer(f"✅ Removed {coin} from watchlist")
+        await query.edit_message_text(f"✅ Removed {coin} from watchlist", parse_mode="HTML")
+    
+    # ============ TP TIERS CALLBACKS ============
+    elif data == "tp_toggle":
+        tp_tiers["enabled"] = not tp_tiers["enabled"]
+        save_positions()
+        status = "ENABLED" if tp_tiers["enabled"] else "DISABLED"
+        await query.answer(f"✅ TP Tiers {status}")
+    
+    elif data == "tp_preset_conservative":
+        tp_tiers["tiers"] = [
+            {"pct_gain": 3, "sell_pct": 33},
+            {"pct_gain": 6, "sell_pct": 33},
+            {"pct_gain": 10, "sell_pct": 34},
+        ]
+        save_positions()
+        await query.answer("✅ Conservative preset applied")
+    
+    elif data == "tp_preset_balanced":
+        tp_tiers["tiers"] = [
+            {"pct_gain": 5, "sell_pct": 25},
+            {"pct_gain": 10, "sell_pct": 25},
+            {"pct_gain": 20, "sell_pct": 25},
+        ]
+        save_positions()
+        await query.answer("✅ Balanced preset applied")
+    
+    elif data == "tp_preset_aggressive":
+        tp_tiers["tiers"] = [
+            {"pct_gain": 10, "sell_pct": 20},
+            {"pct_gain": 25, "sell_pct": 30},
+            {"pct_gain": 50, "sell_pct": 25},
+        ]
+        save_positions()
+        await query.answer("✅ Aggressive preset applied")
+    
+    # ============ DCA CALLBACKS ============
+    elif data == "dca_toggle":
+        dca_settings["enabled"] = not dca_settings["enabled"]
+        save_positions()
+        status = "ENABLED" if dca_settings["enabled"] else "DISABLED"
+        await query.answer(f"✅ DCA Autopilot {status}")
+    
+    elif data.startswith("dca_drop_"):
+        pct = int(data.replace("dca_drop_", ""))
+        dca_settings["drop_pct"] = pct
+        save_positions()
+        await query.answer(f"✅ DCA trigger set to {pct}% drop")
+    
+    elif data.startswith("dca_amt_"):
+        amt = int(data.replace("dca_amt_", ""))
+        dca_settings["amount_usd"] = amt
+        save_positions()
+        await query.answer(f"✅ DCA amount set to ${amt}")
+    
+    elif data.startswith("dca_max_"):
+        max_buys = int(data.replace("dca_max_", ""))
+        dca_settings["max_per_day"] = max_buys
+        save_positions()
+        await query.answer(f"✅ Max DCA buys set to {max_buys}/day")
 
 
 # ============ REGISTER HANDLERS ============
@@ -3024,12 +3793,36 @@ tg_app.add_handler(CommandHandler("pause", pause_cmd))
 tg_app.add_handler(CommandHandler("regime", regime_cmd))
 tg_app.add_handler(CommandHandler("strategies", strategies_cmd))
 tg_app.add_handler(CommandHandler("stats", stats_cmd))
-# New commands
+# Trading commands
 tg_app.add_handler(CommandHandler("buy", buy_cmd))
 tg_app.add_handler(CommandHandler("sell", sell_cmd))
 tg_app.add_handler(CommandHandler("limit", limit_cmd))
 tg_app.add_handler(CommandHandler("history", history_cmd))
 tg_app.add_handler(CommandHandler("performance", performance_cmd))
+# New feature commands
+tg_app.add_handler(CommandHandler("risk", risk_cmd))
+tg_app.add_handler(CommandHandler("watchlist", watchlist_cmd))
+tg_app.add_handler(CommandHandler("watch", watchlist_cmd))
+tg_app.add_handler(CommandHandler("tptiers", tptiers_cmd))
+tg_app.add_handler(CommandHandler("dcaauto", dcaauto_cmd))
+tg_app.add_handler(CommandHandler("summary", summary_cmd))
+tg_app.add_handler(CommandHandler("chart", chart_cmd))
+tg_app.add_handler(CommandHandler("streak", streak_cmd))
+tg_app.add_handler(CommandHandler("besttrades", besttrades_cmd))
+tg_app.add_handler(CommandHandler("news", news_cmd))
+tg_app.add_handler(CommandHandler("whale", whale_cmd))
+tg_app.add_handler(CommandHandler("timeframe", timeframe_cmd))
+tg_app.add_handler(CommandHandler("tf", timeframe_cmd))
+tg_app.add_handler(CommandHandler("backtest", backtest_cmd))
+tg_app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
+tg_app.add_handler(CommandHandler("alert", alert_cmd))
+tg_app.add_handler(CommandHandler("alerts", alerts_cmd))
+tg_app.add_handler(CommandHandler("dca", dca_cmd))
+tg_app.add_handler(CommandHandler("autopilot", autopilot_cmd))
+tg_app.add_handler(CommandHandler("pause", pause_cmd))
+tg_app.add_handler(CommandHandler("regime", regime_cmd))
+tg_app.add_handler(CommandHandler("strategies", strategies_cmd))
+tg_app.add_handler(CommandHandler("stats", stats_cmd))
 tg_app.add_handler(CallbackQueryHandler(button_callback))
 
 
@@ -3326,6 +4119,237 @@ async def autopilot_scanner():
             print(f"[AUTOPILOT ERROR] {e}")
 
 
+# ============ NEW BACKGROUND TASKS ============
+async def daily_summary_scheduler():
+    """Send daily summary at 9 PM."""
+    while True:
+        try:
+            tz = pytz.timezone("America/Chicago")
+            now = datetime.now(tz)
+            
+            # Send at 9 PM
+            if now.hour == 21 and now.minute < 5:
+                for chat_id in AUTO_SIGNAL_CHATS:
+                    await send_daily_summary(chat_id)
+                await asyncio.sleep(3600)  # Wait an hour to avoid duplicates
+            else:
+                await asyncio.sleep(60)
+        except Exception as e:
+            print(f"[SUMMARY ERROR] {e}")
+
+
+async def dca_autopilot_scanner():
+    """DCA autopilot - buy dips automatically."""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Check every 5 minutes
+            
+            if not dca_settings["enabled"]:
+                continue
+            
+            if dca_settings["today_count"] >= dca_settings["max_per_day"]:
+                continue
+            
+            # Check balance
+            usd_balance = 0
+            if cdp_client:
+                usd_balance = await cdp_client.get_usd_balance()
+            
+            if usd_balance < dca_settings["amount_usd"]:
+                continue
+            
+            for pair in dca_settings["coins"]:
+                try:
+                    # Get 24h data
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(f"https://api.exchange.coinbase.com/products/{pair}/stats") as resp:
+                            if resp.status == 200:
+                                stats = await resp.json()
+                                high_24h = float(stats.get("high", 0))
+                                current = float(stats.get("last", 0))
+                                
+                                if high_24h > 0:
+                                    drop_pct = ((high_24h - current) / high_24h) * 100
+                                    
+                                    if drop_pct >= dca_settings["drop_pct"]:
+                                        # DCA buy!
+                                        if LIVE_TRADING and cdp_client:
+                                            result = await cdp_client.place_market_order(pair, "BUY", dca_settings["amount_usd"])
+                                            
+                                            if result.get("success_response") or result.get("order_id"):
+                                                dca_settings["today_count"] += 1
+                                                
+                                                # Track position
+                                                if pair not in positions:
+                                                    positions[pair] = {
+                                                        "entry_price": current,
+                                                        "highest_price": current,
+                                                        "amount_usd": dca_settings["amount_usd"],
+                                                        "timestamp": datetime.now().isoformat(),
+                                                        "live": True,
+                                                        "strategy": "dca_auto"
+                                                    }
+                                                else:
+                                                    # Average down
+                                                    old_amount = positions[pair]["amount_usd"]
+                                                    old_entry = positions[pair]["entry_price"]
+                                                    new_amount = old_amount + dca_settings["amount_usd"]
+                                                    positions[pair]["entry_price"] = ((old_entry * old_amount) + (current * dca_settings["amount_usd"])) / new_amount
+                                                    positions[pair]["amount_usd"] = new_amount
+                                                
+                                                save_positions()
+                                                
+                                                # Alert
+                                                for chat_id in AUTO_SIGNAL_CHATS:
+                                                    try:
+                                                        await tg_app.bot.send_message(
+                                                            chat_id=chat_id,
+                                                            text=f"📉 <b>DCA AUTO-BUY</b>\n\n"
+                                                                 f"📊 {pair}\n"
+                                                                 f"💰 ${dca_settings['amount_usd']} @ ${current:,.2f}\n"
+                                                                 f"📉 Drop: {drop_pct:.1f}% from 24h high\n"
+                                                                 f"🔢 DCA Today: {dca_settings['today_count']}/{dca_settings['max_per_day']}",
+                                                            parse_mode="HTML"
+                                                        )
+                                                    except:
+                                                        pass
+                except Exception as e:
+                    print(f"[DCA] Error for {pair}: {e}")
+            
+        except Exception as e:
+            print(f"[DCA ERROR] {e}")
+
+
+async def risk_monitor():
+    """Monitor risk limits and pause trading if needed."""
+    while True:
+        try:
+            await asyncio.sleep(120)  # Check every 2 minutes
+            
+            # Get current portfolio value
+            total_value = 0
+            if cdp_client:
+                holdings = await cdp_client.get_all_holdings()
+                total_value = holdings.get("total_value", 0)
+            
+            # Update highest balance
+            if total_value > risk_state["highest_balance"]:
+                risk_state["highest_balance"] = total_value
+                save_positions()
+            
+            # Calculate drawdown
+            if risk_state["highest_balance"] > 0:
+                drawdown = ((risk_state["highest_balance"] - total_value) / risk_state["highest_balance"]) * 100
+                risk_state["current_drawdown"] = drawdown
+                
+                # Check max drawdown
+                if drawdown >= risk_state["max_drawdown_pct"]:
+                    if autopilot_settings["enabled"]:
+                        autopilot_settings["enabled"] = False
+                        risk_state["paused_reason"] = f"Max drawdown ({drawdown:.1f}%)"
+                        save_positions()
+                        
+                        for chat_id in AUTO_SIGNAL_CHATS:
+                            try:
+                                await tg_app.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"🚨 <b>RISK ALERT - AUTOPILOT PAUSED</b>\n\n"
+                                         f"📉 Drawdown: {drawdown:.1f}%\n"
+                                         f"⚠️ Exceeded {risk_state['max_drawdown_pct']}% limit\n\n"
+                                         f"Use /autopilot on to resume",
+                                    parse_mode="HTML"
+                                )
+                            except:
+                                pass
+            
+            # Check daily loss limit
+            if daily_pnl["realized"] <= -risk_state["daily_loss_limit"]:
+                if autopilot_settings["enabled"]:
+                    autopilot_settings["enabled"] = False
+                    risk_state["paused_reason"] = f"Daily loss limit (${abs(daily_pnl['realized']):.2f})"
+                    save_positions()
+                    
+                    for chat_id in AUTO_SIGNAL_CHATS:
+                        try:
+                            await tg_app.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"🚨 <b>RISK ALERT - AUTOPILOT PAUSED</b>\n\n"
+                                     f"💔 Today's Loss: ${abs(daily_pnl['realized']):.2f}\n"
+                                     f"⚠️ Exceeded ${risk_state['daily_loss_limit']} limit\n\n"
+                                     f"Use /autopilot on to resume",
+                                parse_mode="HTML"
+                            )
+                        except:
+                            pass
+            
+        except Exception as e:
+            print(f"[RISK MONITOR ERROR] {e}")
+
+
+async def tp_tiers_monitor():
+    """Monitor positions for take profit tiers."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            
+            if not tp_tiers["enabled"]:
+                continue
+            
+            for pair, pos in list(positions.items()):
+                current = await get_public_price(pair)
+                entry = pos["entry_price"]
+                pnl_pct = ((current - entry) / entry) * 100
+                
+                # Check each tier
+                tiers_hit = pos.get("tiers_hit", [])
+                
+                for tier in tp_tiers["tiers"]:
+                    tier_key = f"{tier['pct_gain']}"
+                    
+                    if tier_key in tiers_hit:
+                        continue
+                    
+                    if pnl_pct >= tier["pct_gain"]:
+                        sell_pct = tier["sell_pct"]
+                        sell_amount = pos["amount_usd"] * (sell_pct / 100)
+                        
+                        if LIVE_TRADING and cdp_client:
+                            result = await cdp_client.place_market_order(pair, "SELL", sell_amount)
+                            
+                            if result.get("success_response") or result.get("order_id"):
+                                # Update position
+                                positions[pair]["amount_usd"] -= sell_amount
+                                if "tiers_hit" not in positions[pair]:
+                                    positions[pair]["tiers_hit"] = []
+                                positions[pair]["tiers_hit"].append(tier_key)
+                                
+                                # Track partial P&L
+                                partial_pnl = sell_amount * (pnl_pct / 100)
+                                daily_pnl["realized"] += partial_pnl
+                                
+                                save_positions()
+                                
+                                # Alert
+                                for chat_id in AUTO_SIGNAL_CHATS:
+                                    try:
+                                        await tg_app.bot.send_message(
+                                            chat_id=chat_id,
+                                            text=f"🎯 <b>TP TIER HIT!</b>\n\n"
+                                                 f"📊 {pair}\n"
+                                                 f"📈 +{pnl_pct:.1f}% reached\n"
+                                                 f"💸 Sold {sell_pct}% (${sell_amount:.2f})\n"
+                                                 f"💰 P&L: ${partial_pnl:.2f}\n\n"
+                                                 f"Remaining: ${positions[pair]['amount_usd']:.2f}",
+                                            parse_mode="HTML"
+                                        )
+                                    except:
+                                        pass
+                        break  # Only hit one tier per cycle
+                
+        except Exception as e:
+            print(f"[TP TIERS ERROR] {e}")
+
+
 # ============ FASTAPI ============
 @app.on_event("startup")
 async def on_startup():
@@ -3336,10 +4360,17 @@ async def on_startup():
         await tg_app.bot.set_webhook(url=f"{BASE_URL}/webhook/{WEBHOOK_SECRET}")
         print(f"✅ Webhook set")
     
+    # Start all background tasks
     asyncio.create_task(stop_loss_monitor())
     asyncio.create_task(auto_signal_scheduler())
     asyncio.create_task(price_alert_checker())
     asyncio.create_task(autopilot_scanner())
+    asyncio.create_task(daily_summary_scheduler())
+    asyncio.create_task(dca_autopilot_scanner())
+    asyncio.create_task(risk_monitor())
+    asyncio.create_task(tp_tiers_monitor())
+    
+    print("✅ All background tasks started")
 
 
 @app.on_event("shutdown")
